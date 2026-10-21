@@ -1,0 +1,90 @@
+package morrpcmesssage
+
+import (
+	"encoding/json"
+	"math/big"
+	"os"
+	"testing"
+
+	"github.com/MorpheusAIs/Morpheus-Lumerin-Node/proxy-router/internal/lib"
+	"github.com/MorpheusAIs/Morpheus-Lumerin-Node/proxy-router/internal/system"
+	"github.com/ethereum/go-ethereum/common"
+)
+
+// Generates protocol golden vectors consumed by Morpheus-Core-Node interop tests.
+func TestZZGenerateGoldenVectors(t *testing.T) {
+	out := os.Getenv("GOLDEN_OUT")
+	if out == "" {
+		t.Skip("GOLDEN_OUT not set")
+	}
+	m := NewMorRpc()
+	userKey := lib.MustStringToHexString("0x1111111111111111111111111111111111111111111111111111111111111111")
+	provKey := lib.MustStringToHexString("0x2222222222222222222222222222222222222222222222222222222222222222")
+	userAddr := lib.MustPrivKeyStringToAddr(userKey.Hex())
+	provAddr := lib.MustPrivKeyStringToAddr(provKey.Hex())
+	userPub, _ := lib.PubKeyFromPrivate(userKey)
+	provPub, _ := lib.PubKeyFromPrivate(provKey)
+	chainID := big.NewInt(84532)
+	bidID := common.HexToHash("0xabababababababababababababababababababababababababababababababab")
+	sessionID := common.HexToHash("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+
+	v := map[string]any{
+		"userKey": userKey.Hex(), "providerKey": provKey.Hex(),
+		"userAddr": userAddr.Hex(), "providerAddr": provAddr.Hex(),
+		"userPub": userPub.Hex(), "providerPub": provPub.Hex(),
+		"chainId": chainID.String(), "bidId": bidID.Hex(), "sessionId": sessionID.Hex(),
+	}
+
+	ping, err := m.PingRequest("1", userKey, lib.MustStringToHexString("0x0102030405060708"))
+	if err != nil { t.Fatal(err) }
+	v["pingRequest"] = ping
+
+	ok := true
+	pong, err := m.PongResponce("1", provKey, lib.MustStringToHexString("0x0102030405060708"), "v7.0.0", []system.ModelHealthReport{{ModelID: bidID.Hex(), Status: "healthy", HasActiveBid: true, LastChecked: 1, PromptCorrect: &ok}})
+	if err != nil { t.Fatal(err) }
+	v["pongResponse"] = pong
+
+	sreq, err := m.InitiateSessionRequest(userAddr, provAddr, big.NewInt(123456789), bidID, userKey, "2")
+	if err != nil { t.Fatal(err) }
+	v["sessionRequest"] = sreq
+
+	sres, err := m.InitiateSessionResponse(provPub, userAddr, bidID, provKey, "2", chainID)
+	if err != nil { t.Fatal(err) }
+	v["sessionResponse"] = sres
+
+	prompt := map[string]any{"model": "x", "stream": true, "messages": []map[string]string{{"role": "user", "content": "hi <b>&</b> ünïcode ✓"}}}
+	preq, err := m.SessionPromptRequest(sessionID, prompt, provPub, userKey, "3")
+	if err != nil { t.Fatal(err) }
+	v["promptRequest"] = preq
+
+	chunk := `{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hello <world> & ✓"}}]}`
+	enc, err := lib.EncryptString(chunk, lib.RemoveHexPrefix(userPub.Hex()))
+	if err != nil { t.Fatal(err) }
+	pres, err := m.SessionPromptResponse(enc, provKey, "3")
+	if err != nil { t.Fatal(err) }
+	v["promptResponse"] = pres
+	v["promptResponsePlain"] = chunk
+
+	done, _ := json.Marshal("[DONE]")
+	encDone, _ := lib.EncryptString(string(done), lib.RemoveHexPrefix(userPub.Hex()))
+	dres, _ := m.SessionPromptResponse(encDone, provKey, "3")
+	v["promptDoneResponse"] = dres
+
+	errPlain := `{"providerModelError":{"error":{"message":"rate limited"}},"statusCode":429}`
+	encErr, _ := lib.EncryptString(errPlain, lib.RemoveHexPrefix(userPub.Hex()))
+	eres, err := m.ResponseError(encErr, provKey, "3")
+	if err != nil { t.Fatal(err) }
+	v["errorResponse"] = eres
+	v["errorResponsePlain"] = errPlain
+
+	rreq, err := m.SessionReportRequest(sessionID, userKey, "4")
+	if err != nil { t.Fatal(err) }
+	v["reportRequest"] = rreq
+
+	rres, err := m.SessionReportResponse(1500, 250, 10, 20, sessionID, provKey, "4", chainID)
+	if err != nil { t.Fatal(err) }
+	v["reportResponse"] = rres
+
+	b, _ := json.MarshalIndent(v, "", "  ")
+	if err := os.WriteFile(out, b, 0o644); err != nil { t.Fatal(err) }
+}

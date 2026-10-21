@@ -1,0 +1,149 @@
+package proxyapi
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	gcs "github.com/MorpheusAIs/Morpheus-Lumerin-Node/proxy-router/internal/chatstorage/genericchatstorage"
+	"github.com/MorpheusAIs/Morpheus-Lumerin-Node/proxy-router/internal/lib"
+	msgs "github.com/MorpheusAIs/Morpheus-Lumerin-Node/proxy-router/internal/proxyapi/morrpcmessage"
+	"github.com/gin-gonic/gin/binding"
+)
+
+// Verifies messages produced by Morpheus-Core-Node with the reference code paths.
+func TestZZMorcoreInterop(t *testing.T) {
+	path := os.Getenv("MORCORE_VECTORS")
+	if path == "" {
+		t.Skip("MORCORE_VECTORS not set")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		SessionRequest  msgs.RPCMessage  `json:"sessionRequest"`
+		PromptRequest   msgs.RPCMessage  `json:"promptRequest"`
+		ReportRequest   msgs.RPCMessage  `json:"reportRequest"`
+		PongResponse    msgs.RpcResponse `json:"pongResponse"`
+		SessionResponse msgs.RpcResponse `json:"sessionResponse"`
+		PromptResponse  msgs.RpcResponse `json:"promptResponse"`
+		SignedError     msgs.RpcResponse `json:"signedError"`
+		ReportResponse  msgs.RpcResponse `json:"reportResponse"`
+		PlainError      msgs.RpcResponse `json:"plainError"`
+		UserPub         string           `json:"userPub"`
+		ProviderPub     string           `json:"providerPub"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	m := msgs.NewMorRpc()
+	log := lib.NewTestLogger()
+	userPub := lib.MustStringToHexString(v.UserPub)
+	provPub := lib.MustStringToHexString(v.ProviderPub)
+	userKey := lib.MustStringToHexString("0x1111111111111111111111111111111111111111111111111111111111111111")
+	provAddr := lib.MustPrivKeyStringToAddr("0x2222222222222222222222222222222222222222222222222222222222222222")
+
+	// Provider-side checks (reference MORRPCController) of our consumer requests.
+	var sreq msgs.SessionReq
+	if err := json.Unmarshal(v.SessionRequest.Params, &sreq); err != nil {
+		t.Fatal(err)
+	}
+	sig := sreq.Signature
+	sreq.Signature = lib.HexString{}
+	if !m.VerifySignature(sreq, sig, sreq.Key, log) {
+		t.Fatal("reference rejected our session.request signature")
+	}
+	var preq msgs.SessionPromptReq
+	_ = json.Unmarshal(v.PromptRequest.Params, &preq)
+	sig = preq.Signature
+	preq.Signature = lib.HexString{}
+	if !m.VerifySignature(preq, sig, userPub, log) {
+		t.Fatal("reference rejected our session.prompt signature")
+	}
+	var chat gcs.OpenAICompletionRequestExtra
+	if err := json.Unmarshal([]byte(preq.Message), &chat); err != nil || !strings.Contains(chat.Messages[0].Content, "✓") {
+		t.Fatalf("reference cannot parse our prompt body: %v", err)
+	}
+	var rreq msgs.SessionReportReq
+	_ = json.Unmarshal(v.ReportRequest.Params, &rreq)
+	sig = rreq.Signature
+	rreq.Signature = lib.HexString{}
+	if !m.VerifySignature(rreq, sig, userPub, log) {
+		t.Fatal("reference rejected our session.report signature")
+	}
+
+	// Consumer-side checks (reference ProxyServiceSender) of our provider responses.
+	var pong *msgs.PongRes
+	_ = json.Unmarshal(*v.PongResponse.Result, &pong)
+	if err := binding.Validator.ValidateStruct(pong); err != nil {
+		t.Fatalf("pong fails reference validation: %v", err)
+	}
+	sig = pong.Signature
+	pong.Signature, pong.Models = lib.HexString{}, nil
+	if !m.VerifySignatureAddr(pong, sig, provAddr, log) {
+		t.Fatal("reference rejected our pong signature")
+	}
+
+	var sres *msgs.SessionRes
+	_ = json.Unmarshal(*v.SessionResponse.Result, &sres)
+	if err := binding.Validator.ValidateStruct(sres); err != nil {
+		t.Fatalf("session response fails reference validation: %v", err)
+	}
+	sig = sres.Signature
+	sres.Signature = lib.HexString{}
+	if !m.VerifySignature(sres, sig, sres.PubKey, log) {
+		t.Fatal("reference rejected our session approval signature")
+	}
+
+	var inf InferenceRes
+	_ = json.Unmarshal(*v.PromptResponse.Result, &inf)
+	sig = inf.Signature
+	inf.Signature = []byte{}
+	if !m.VerifySignature(inf, sig, provPub, log) {
+		t.Fatal("reference rejected our inference chunk signature")
+	}
+	var ct lib.HexString
+	if err := json.Unmarshal(inf.Message, &ct); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := lib.DecryptBytes(ct, userKey)
+	if err != nil || !strings.Contains(string(plain), "chat.completion.chunk") {
+		t.Fatalf("reference cannot decrypt our chunk: %v", err)
+	}
+	var stream gcs.ChatCompletionStreamResponseExtra
+	if err := json.Unmarshal(plain, &stream); err != nil || stream.Choices[0].Delta.Content != "hi" {
+		t.Fatalf("reference cannot parse our chunk: %v", err)
+	}
+
+	e := v.SignedError.Error
+	sig = e.Data.Signature
+	e.Data.Signature = []byte{}
+	if !m.VerifySignature(e, sig, provPub, log) {
+		t.Fatal("reference rejected our signed error")
+	}
+	errPlain, err := lib.DecryptString(e.Message, userKey.Hex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aie gcs.AiEngineErrorResponse
+	if err := json.Unmarshal([]byte(errPlain), &aie); err != nil || aie.HTTPStatusCode() != 503 {
+		t.Fatalf("reference cannot parse our engine error: %v %+v", err, aie)
+	}
+
+	var rres *msgs.SessionReportRes
+	_ = json.Unmarshal(*v.ReportResponse.Result, &rres)
+	if err := binding.Validator.ValidateStruct(rres); err != nil {
+		t.Fatalf("report fails reference validation: %v", err)
+	}
+	sig = rres.Signature
+	rres.Signature = lib.HexString{}
+	if !m.VerifySignature(rres, sig, provPub, log) {
+		t.Fatal("reference rejected our report signature")
+	}
+
+	if s := v.PlainError.Error.Data.Signature.String(); s != "0x00" {
+		t.Fatalf("plain error signature %s, reference expects 0x00", s)
+	}
+}
