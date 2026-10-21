@@ -77,3 +77,20 @@ func TestAssignAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestStakeScoreWithRealisticAmounts(t *testing.T) {
+	mor := func(n int64) *big.Int { return new(big.Int).Mul(big.NewInt(n), big.NewInt(1e18)) }
+	at := func(stake int64) float64 {
+		// Only the stake term counts; a price of 1 MOR/s leaves it unscaled.
+		return Score(Weights{Stake: 1}, ScoreInput{ProviderStake: mor(stake), MinStake: mor(10), PricePerSecond: mor(1)})
+	}
+	if got := at(10); got != 0 {
+		t.Fatalf("stake at the minimum scored %v, want 0", got)
+	}
+	if got := at(55); got < 0.4999 || got > 0.5001 {
+		t.Fatalf("stake at 5.5x the minimum scored %v, want 0.5", got)
+	}
+	if got := at(1000); got != 1 {
+		t.Fatalf("stake far above 10x the minimum scored %v, want 1", got)
+	}
+}

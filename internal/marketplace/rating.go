@@ -46,12 +46,12 @@ func Score(w Weights, in ScoreInput) float64 {
 	success := math.Pow(ratio(pm.SuccessCount, pm.TotalCount), 2)
 	stake := 0.0
 	if in.ProviderStake != nil && in.MinStake != nil {
-		stake = normMinMax(in.ProviderStake.Int64(), in.MinStake.Int64(), 10*in.MinStake.Int64())
+		lo := toFloat(in.MinStake)
+		stake = normMinMax(toFloat(in.ProviderStake), lo, 10*lo)
 	}
 	total := w.TPS*tps + w.TTFT*ttft + w.Duration*dur + w.Success*success + w.Stake*stake
 
-	price, _ := new(big.Float).SetInt(in.PricePerSecond).Float64()
-	price /= 1e18
+	price := toFloat(in.PricePerSecond) / 1e18
 	if price <= 0 {
 		return math.Inf(1)
 	}
@@ -81,14 +81,21 @@ func normRange(x, r float64) float64 {
 	return math.Max(0, math.Min(1, v))
 }
 
-func normMinMax(v, lo, hi int64) float64 {
+func normMinMax(v, lo, hi float64) float64 {
 	if hi == lo || v < lo {
 		return 0
 	}
 	if v > hi {
 		return 1
 	}
-	return float64(v-lo) / float64(hi-lo)
+	return (v - lo) / (hi - lo)
+}
+
+// toFloat converts a wei amount. The reference scorer uses Int64() here, which
+// wraps for stakes above ~9.2 MOR; ranking is local, so we compute it exactly.
+func toFloat(v *big.Int) float64 {
+	f, _ := new(big.Float).SetInt(v).Float64()
+	return f
 }
 
 // SessionStake is the MOR (wei) to escrow for a session of durationSec at
