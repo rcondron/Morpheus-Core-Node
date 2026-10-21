@@ -1,0 +1,17 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local node homes used during development
+/.morcore/
+/home/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

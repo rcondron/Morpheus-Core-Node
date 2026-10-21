@@ -1,0 +1,117 @@
+{
+  "bidId": "0xabababababababababababababababababababababababababababababababab",
+  "chainId": "84532",
+  "errorResponse": {
+    "id": "3",
+    "result": null,
+    "error": {
+      "message": "048661da591e97110117a6ab7bd34e25e51447ab044aac5ea979283a15c72e0ac82f8153e65887061bfde6216d243a6a3eae8dc337152aba78a33fca591d7ff5acec3f97f42a5cb03aec06fc3f328953a987763281793e8bbbc176a344402644d0b88538042b2f71a78676a30bb8786828e63940a52fb000c67c101bdda6cb17a1a4616274866a96e825d1d5ca3e31996f8793c414465741a8925900a4d65cdd7230bdd7281bb82bf99d11d86d672628bf6d0a970f1b1044cfc23ecde3",
+      "code": 400,
+      "data": {
+        "timestamp": 1792595244717,
+        "signature": "0xcf6a6a2745063d1d64dcdd373426d2db52a1bd1862c51173d495a0b2879934ec7e4ab1e63747d28ebf9b544d8ab1c9df5c3316b54cc6ff3951efeacb1642bf8800"
+      }
+    }
+  },
+  "errorResponsePlain": "{\"providerModelError\":{\"error\":{\"message\":\"rate limited\"}},\"statusCode\":429}",
+  "pingRequest": {
+    "id": "1",
+    "method": "network.ping",
+    "params": {
+      "nonce": "0x0102030405060708",
+      "signature": "0xafc1113358935b28a9f2e9d912496a158635cf474c5dd11e84028ec4a6ecefe5627f2f63f6a8304afe2c7b03d12074a88da232c75db33cc4997ae0dab5b8f95200"
+    }
+  },
+  "pongResponse": {
+    "id": "1",
+    "result": {
+      "nonce": "0x0102030405060708",
+      "version": "v7.0.0",
+      "models": [
+        {
+          "modelId": "0xabababababababababababababababababababababababababababababababab",
+          "hasActiveBid": true,
+          "status": "healthy",
+          "lastChecked": 1,
+          "promptCorrect": true
+        }
+      ],
+      "signature": "0x7c790e54bc23721792a1997d860612e5cf29673004c6cb33916ee6d06193a80321d63d0317266da40704655440aa1282636fb8b62c889730be8a39edaed9804400"
+    }
+  },
+  "promptDoneResponse": {
+    "id": "3",
+    "result": {
+      "message": "04ccba32ba77c7fdef9e2d3cb8141ff7772d1d41150ffdef5390d30580cace34c6219c6021a6d6a2a68837ca86857f3c7b99ba8b8c5d013a6d569df3d01feabd2bca904e5049e8d05e80ff48c7422172a36b44a361025b3b913fc601a3e7af830969294484262093a131dcfee05590d644a08bc651233e04cb",
+      "signature": "0xe15de4baa29dbd115eabf098927472a300b64237ae76f7f44a7bc2f60dbaedfe4a233ae69885a978f6cb1c592aaddca8e842e746cefea48d1622357c280f719401",
+      "timestamp": 1792595244717
+    }
+  },
+  "promptRequest": {
+    "id": "3",
+    "method": "session.prompt",
+    "params": {
+      "signature": "0xef2bbe6f1d3e828ac80187b81d7745360a567f9838b92b696cc19e82124f885942948c43dcfdc5cc970d97cba13176299711a25ff134863d03d674dc7d1a5bda01",
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "message": "{\"messages\":[{\"content\":\"hi \\u003cb\\u003e\\u0026\\u003c/b\\u003e ünïcode ✓\",\"role\":\"user\"}],\"model\":\"x\",\"stream\":true}",
+      "timestamp": 1792595244717
+    }
+  },
+  "promptResponse": {
+    "id": "3",
+    "result": {
+      "message": "044b381447634cf20683a0521a7254af930eb5c4ff0ffc19cfc969d1928db7f2bf0f9eb6004603c174412bb5431049ade5227a1fa5875293a723e8a3e5cf7ee81e3bee27acb6e55e07067412c12bb278a39b1c7c18431fc01d3efa5d96c2a92f813b526f9fb53f98cbcf3418b57dd01827078466b5e04c64d50f7beaf0bc0ae4ce2f1154c85a867bf9fbc939421d502b1d37ae23788c412ed0516e97cdd5d6d02d7d1987ed2d6dc82efee85b7e7e653eeb5305bcbf5d05a31767ed9e91d3e9f2fe123f9da175e0125c2fe4554e103fd359f185a9ce3fdc997fd4f541865ffda2f2633c92a489546b7b076c6c84a4f88815e9ddb8a1793f",
+      "signature": "0x2794b3cdf877c907e7943e6feed542ccfccc0f529bec47a70cf564fe321538522a2b93f747e5db0678d038b74a2197e4035c8afad792cf3f9bde5e7a2473e2df01",
+      "timestamp": 1792595244717
+    }
+  },
+  "promptResponsePlain": "{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \u003cworld\u003e \u0026 ✓\"}}]}",
+  "providerAddr": "0x1563915e194D8CfBA1943570603F7606A3115508",
+  "providerKey": "0x2222222222222222222222222222222222222222222222222222222222222222",
+  "providerPub": "0x04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+  "reportRequest": {
+    "id": "4",
+    "method": "session.report",
+    "params": {
+      "signature": "0xeed796e3eb1c42ea7b17a310701163d053af0cf45e7e853d432382c42e5d7cce12b7d215c151883631db8bfc495385ad9d0953f44d4245ee2082a6c2e43d48eb00",
+      "message": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "timestamp": 1792595244717
+    }
+  },
+  "reportResponse": {
+    "id": "4",
+    "result": {
+      "message": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0000000000000000000000000000000000000000000000000000000000014a34000000000000000000000000000000000000000000000000000001a15f00b6ad00000000000000000000000000000000000000000000000000000000000005dc00000000000000000000000000000000000000000000000000000000000000fa000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000014",
+      "signedReport": "0x039721d37c8b7983b74c7884c5af7b7dc86f598e2beba59b38c52187b5503a0a622060adcadd1d4386262168fd5eed8f58cc3353d40b490df5cae45d816b984e1c",
+      "signature": "0x8b89d3e87ca82b1b415f9d154e163c302d3057f6b3ea1246ca46de74655cec68015fe6defaa6043b0fc6207f2d598221384ca8725b7442b3ab9845e7d5e5df2b01",
+      "timestamp": 1792595244717
+    }
+  },
+  "sessionId": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "sessionRequest": {
+    "id": "2",
+    "method": "session.request",
+    "params": {
+      "signature": "0x962cde9ef131a7fc15fc7ee56fa7beeaf1efdc39f078af298ddaf233cd76af0315ac525258fda7378e4731526d53f77c30b6e8f58305dbb04e5e1f3fd42ea85101",
+      "user": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "key": "0x044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+      "spend": "123456789",
+      "timestamp": 1792595244716,
+      "bidid": "0xabababababababababababababababababababababababababababababababab"
+    }
+  },
+  "sessionResponse": {
+    "id": "2",
+    "result": {
+      "message": "0x04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
+      "approval": "0xabababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000014a3400000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a000000000000000000000000000000000000000000000000000001a15f00b6ac",
+      "approvalSig": "0x3adf8d7782847f3fbfa7b7ea33073e9deb9eb38c642b30fef472cd295dca81e1142b63d5a0a6a0f0ec64f0b93c9333ccb9445cc9a89644985ff518be64f8bce51c",
+      "user": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "timestamp": 1792595244716,
+      "signature": "0xc7dcbb4f250ecc92b9fba75fe69149f7607ef70af3f7d98f5416e2e27b12da2a318bca58ef8c684127fafab20295f34e08d5a9c7a90b52f199053079ec79fd8301"
+    }
+  },
+  "userAddr": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+  "userKey": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "userPub": "0x044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1"
+}
