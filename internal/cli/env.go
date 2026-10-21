@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -51,6 +52,9 @@ func (a *App) unlock(cfg *config.Config) (*wallet.Wallet, error) {
 			w, err = wallet.LoadKeystore(path, pw)
 			return err
 		})
+		// scrypt needs 64 MiB once; hand it back to the OS rather than
+		// carrying it in the node's resident memory for its whole life.
+		debug.FreeOSMemory()
 		return w, err
 	}
 	if pw := os.Getenv("MORCORE_PASSWORD"); pw != "" {

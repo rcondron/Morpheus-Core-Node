@@ -90,10 +90,10 @@ func Main(args []string) int {
 		fmt.Fprintln(a.Err, tui.Danger.Render("error: ")+err.Error())
 		return 2
 	}
-	if *noColor {
+	rest, lateNoColor := a.globalFlags(fs.Args())
+	if *noColor || lateNoColor {
 		os.Setenv("NO_COLOR", "1")
 	}
-	rest := fs.Args()
 	if *version {
 		rest = []string{"version"}
 	}
@@ -121,6 +121,31 @@ func Main(args []string) int {
 		}
 	}
 	return a.exit(cmd.run(a, cmdArgs))
+}
+
+// globalFlags extracts global flags given after the command name, so that
+// `morcore keys list --json` works like `morcore --json keys list`.
+func (a *App) globalFlags(args []string) (rest []string, noColor bool) {
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		x := args[i]
+		switch {
+		case x == "--":
+			return append(rest, args[i:]...), noColor
+		case x == "--json" || x == "-json":
+			a.JSON = true
+		case x == "--no-color" || x == "-no-color":
+			noColor = true
+		case (x == "--home" || x == "-home") && i+1 < len(args):
+			a.Home = args[i+1]
+			i++
+		case strings.HasPrefix(x, "--home=") || strings.HasPrefix(x, "-home="):
+			a.Home = x[strings.IndexByte(x, '=')+1:]
+		default:
+			rest = append(rest, x)
+		}
+	}
+	return rest, noColor
 }
 
 func find(cmds []*command, args []string) (*command, []string) {

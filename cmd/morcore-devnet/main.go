@@ -3,8 +3,11 @@
 // Multicall3, one or more providers, and an echo model (or your own
 // OpenAI-compatible backend). No real funds are involved.
 //
-//	go run ./cmd/morcore-devnet --fund 0xYourAddress
-//	morcore init --yes --network local --password-env MORCORE_PASSWORD --api-key demo
+//	go run ./cmd/morcore-devnet
+//	morcore init --yes --network local --key-env DEVNET_KEY --password-env MORCORE_PASSWORD --api-key demo
+//
+// The devnet always funds Hardhat's well-known test account (devKey), so a
+// node can connect without any setup; --fund adds more addresses.
 package main
 
 import (
@@ -33,9 +36,13 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
 )
 
+// devKey is Hardhat/Anvil's account #0. It is published everywhere, so it must
+// never hold real funds; here it only exists on the simulated chain.
+const devKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
 func main() {
 	rpcAddr := flag.String("rpc", "127.0.0.1:8545", "JSON-RPC listen address")
-	fund := flag.String("fund", "", "comma-separated addresses to fund with 1000 MOR and 1 ETH")
+	fund := flag.String("fund", "", "comma-separated extra addresses to fund with 1000 MOR and 1 ETH")
 	backend := flag.String("backend", "", "OpenAI-compatible chat completions URL (default: built-in echo model)")
 	backendModel := flag.String("backend-model", "echo", "model name sent to the backend")
 	models := flag.String("models", "llama-3.3-70b,qwen3-235b", "comma-separated marketplace model names to list")
@@ -99,16 +106,18 @@ func main() {
 		go func() { _ = (&morrpc.Server{Handler: p.Handle, Log: log}).Serve(ctx, pln) }()
 		fmt.Printf("  Provider %d   %s at %s\n", pi+1, pw.Address().Hex(), pln.Addr())
 	}
-	for _, a := range strings.Split(*fund, ",") {
+	dev, _ := wallet.FromHex(devKey)
+	for _, a := range append([]string{dev.Address().Hex()}, strings.Split(*fund, ",")...) {
 		if a = strings.TrimSpace(a); common.IsHexAddress(a) {
 			fc.Fund(common.HexToAddress(a), chaintest.MORs(1), chaintest.MORs(1000))
 			fmt.Printf("  Funded       %s with 1000 MOR + 1 ETH\n", a)
 		}
 	}
-	fmt.Println("\nConnect a node:")
+	fmt.Println("\nConnect a node (devnet only: this is Hardhat's public test key):")
 	fmt.Println("  export MORCORE_HOME=$(mktemp -d) MORCORE_PASSWORD=devnet-password")
-	fmt.Println("  morcore init --yes --network local --password-env MORCORE_PASSWORD --api-key demo --key-env MORCORE_PRIVATE_KEY")
-	fmt.Println("  (fund the printed address by restarting devnet with --fund, or use a key you funded)")
+	fmt.Println("  export DEVNET_KEY=" + devKey)
+	fmt.Println("  morcore init --yes --network local --key-env DEVNET_KEY --password-env MORCORE_PASSWORD --api-key demo")
+	fmt.Println("  morcore start")
 	fmt.Println("\nCtrl+C to stop.")
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
