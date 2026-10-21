@@ -48,6 +48,18 @@ var networks = map[string]Network{
 	},
 }
 
+func init() {
+	// Local simulated marketplace started by `morcore-devnet` (development only).
+	networks["local"] = Network{
+		Name:            "local",
+		Label:           "Local devnet",
+		ChainID:         31337,
+		DiamondAddress:  "0x6aBE1d282f72B474E54527D93b979A4f64d3030a",
+		MORTokenAddress: "0x7431aDa8a591C955a994a21710752EF9b882b8e3",
+		PublicRPCs:      []string{"http://127.0.0.1:8545"},
+	}
+}
+
 // LookupNetwork returns the named network.
 func LookupNetwork(name string) (Network, error) {
 	n, ok := networks[name]

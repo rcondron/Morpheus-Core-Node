@@ -296,6 +296,10 @@ func (n *Node) background(ctx context.Context) {
 	bal := time.NewTicker(time.Minute)
 	defer flush.Stop()
 	defer bal.Stop()
+	evs, unsubscribe := n.Bus.Subscribe()
+	defer unsubscribe()
+	// Session opens/closes move MOR; refresh shortly after so displays track them.
+	var soon <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -305,6 +309,13 @@ func (n *Node) background(ctx context.Context) {
 				n.Log.Warn("could not save key usage", "err", err)
 			}
 		case <-bal.C:
+			n.refreshBalances(ctx)
+		case v := <-evs:
+			if e, ok := v.(events.Event); ok && (e.Kind == "session" || e.Kind == "provider") && soon == nil {
+				soon = time.After(3 * time.Second)
+			}
+		case <-soon:
+			soon = nil
 			n.refreshBalances(ctx)
 		}
 	}

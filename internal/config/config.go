@@ -67,7 +67,7 @@ type Config struct {
 
 type ChainConfig struct {
 	RPCURLs         []string `toml:"rpc_urls"`
-	ChainID         int64    `toml:"chain_id,omitempty"`
+	ChainID         int64    `toml:"chain_id,omitzero"`
 	DiamondAddress  string   `toml:"diamond_address,omitempty"`
 	MORTokenAddress string   `toml:"mor_token_address,omitempty"`
 	LegacyTx        bool     `toml:"legacy_tx"`
