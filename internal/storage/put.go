@@ -184,18 +184,25 @@ func (s *Store) place(ctx context.Context, size uint64, exclude map[common.Addre
 		}
 	}
 	s.mu.Unlock()
-	if len(roomy) > 0 {
-		sort.Slice(roomy, func(i, j int) bool {
-			return cheaper(Offer{Price: roomy[i].Price, Quota: roomy[i].Quota}, Offer{Price: roomy[j].Price, Quota: roomy[j].Quota})
-		})
-		return reserve(roomy[0])
+	sort.Slice(roomy, func(i, j int) bool {
+		return cheaper(Offer{Price: roomy[i].Price, Quota: roomy[i].Quota}, Offer{Price: roomy[j].Price, Quota: roomy[j].Quota})
+	})
+	var reasons []string
+	for _, l := range roomy {
+		pi, err := s.info(ctx, l.peer())
+		if err == nil {
+			err = pi.fits(l.Listing, size)
+		}
+		if err == nil {
+			return reserve(l)
+		}
+		reasons = append(reasons, fmt.Sprintf("%s: %v", short(l.Provider.Hex()), err))
 	}
 
 	offers, err := s.Offers(ctx)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialOffers) {
 		return nil, nil, fmt.Errorf("read storage offers: %w", err)
 	}
-	var reasons []string
 	tried := 0
 	for _, o := range offers {
 		if exclude[o.Provider] {
@@ -206,6 +213,15 @@ func (s *Store) place(ctx context.Context, size uint64, exclude map[common.Addre
 		s.mu.Unlock()
 		if quota+o.Quota < used[o.Provider]+size {
 			reasons = append(reasons, fmt.Sprintf("%s sells %s per lease", short(o.Provider.Hex()), config.FormatBytes(o.Quota)))
+			continue
+		}
+		// Check the provider's terms before paying for a lease there.
+		pi, err := s.info(ctx, peer{o.Provider, o.Endpoint})
+		if err == nil {
+			err = pi.fits(o.Listing.ID, size)
+		}
+		if err != nil {
+			reasons = append(reasons, fmt.Sprintf("%s: %v", short(o.Provider.Hex()), err))
 			continue
 		}
 		if tried++; tried > 4 {
@@ -251,7 +267,7 @@ func (s *Store) lease(ctx context.Context, o Offer) (*Lease, error) {
 	s.mu.Unlock()
 	s.save()
 	if err := s.attach(ctx, l); err != nil {
-		s.log.Warn("provider has not registered the lease yet", "session", l.Session.Hex(), "err", err)
+		s.log.Warn("provider has not registered the lease yet; will retry", "session", l.Session.Hex(), "err", err)
 	}
 	s.log.Info("storage lease opened", "provider", l.Provider.Hex(), "session", l.Session.Hex(), "quota", l.Quota, "ends", l.EndsAt)
 	s.bus.Emit(events.Info, "storage", fmt.Sprintf("leased %s from %s until %s", config.FormatBytes(l.Quota), short(l.Provider.Hex()), l.EndsAt.Local().Format("Jan 2 15:04")))
@@ -261,7 +277,19 @@ func (s *Store) lease(ctx context.Context, o Offer) (*Lease, error) {
 // attach tells the provider about a lease (uploads also attach theirs).
 func (s *Store) attach(ctx context.Context, l *Lease) error {
 	var acct morrpc.StorageAccount
-	return s.call(ctx, l.peer(), morrpc.MethodStorageAttach, morrpc.StorageReq{Session: l.Session.Hex()}, &acct)
+	if err := s.call(ctx, l.peer(), morrpc.MethodStorageAttach, morrpc.StorageReq{Session: l.Session.Hex()}, &acct); err != nil {
+		return err
+	}
+	s.markAttached(l.Session)
+	return nil
+}
+
+func (s *Store) markAttached(id common.Hash) {
+	s.mu.Lock()
+	if l := s.leases[id]; l != nil && !l.Attached {
+		l.Attached, s.dirty = true, true
+	}
+	s.mu.Unlock()
 }
 
 // upload sends a file's stored bytes to a provider under a lease and checks
@@ -273,6 +301,7 @@ func (s *Store) upload(ctx context.Context, l *Lease, data *os.File, f *File) (*
 	if err != nil {
 		return nil, err
 	}
+	s.markAttached(l.Session) // put.start attaches the lease it names
 	if up.Upload == "" {
 		if up.Received != f.StoredBytes {
 			return nil, errors.New("provider did not open an upload")
@@ -306,7 +335,7 @@ func (s *Store) upload(ctx context.Context, l *Lease, data *os.File, f *File) (*
 	// The provider rebuilds the DAG and imports it into IPFS: allow time.
 	wait := 5*time.Minute + time.Duration(f.StoredBytes>>30)*time.Minute
 	var rc morrpc.StorageReceipt
-	if err := s.callWait(ctx, p, morrpc.MethodStoragePutEnd, morrpc.StorageReq{Upload: up.Upload}, wait, &rc); err != nil {
+	if _, err := s.callWait(ctx, p, morrpc.MethodStoragePutEnd, morrpc.StorageReq{Upload: up.Upload}, wait, &rc); err != nil {
 		return nil, err
 	}
 	if rc.CID != f.CID || rc.Size != f.StoredBytes || !strings.EqualFold(rc.Owner, s.w.Address().Hex()) {

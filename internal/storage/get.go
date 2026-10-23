@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -145,7 +146,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 		if err := s.deleteCopy(ctx, c.peer(), f.CID); err != nil {
 			s.log.Warn("provider could not delete the file yet; will retry", "file", id, "provider", c.Provider.Hex(), "err", err)
 			s.mu.Lock()
-			s.orphans = append(s.orphans, Orphan{CID: f.CID, Provider: c.Provider, Endpoint: c.Endpoint})
+			s.orphans = append(s.orphans, Orphan{CID: f.CID, Provider: c.Provider, Endpoint: c.Endpoint, Since: time.Now()})
 			s.dirty = true
 			s.mu.Unlock()
 		}

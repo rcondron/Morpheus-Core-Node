@@ -61,12 +61,31 @@ func (s *Server) files(w http.ResponseWriter) (*storage.Store, bool) {
 // an API key the files it stored.
 func owns(p principal, f *storage.File) bool { return p.admin || f.Owner == p.key.ID }
 
+// admitFiles applies the key's request-rate and concurrency limits to a
+// Files API transfer; release frees the slot.
+func (s *Server) admitFiles(w http.ResponseWriter, p principal) (func(), bool) {
+	if p.admin {
+		return func() {}, true
+	}
+	release, err := s.d.Keys.Admit(p.key.ID)
+	if err != nil {
+		writeLimitError(w, err)
+		return nil, false
+	}
+	return release, true
+}
+
 // uploadFile stores a multipart upload ("file", "purpose") on the marketplace.
 func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	st, ok := s.files(w)
 	if !ok {
 		return
 	}
+	release, ok := s.admitFiles(w, principalFrom(r))
+	if !ok {
+		return
+	}
+	defer release()
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -177,6 +196,11 @@ func (s *Server) fileContent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	release, ok := s.admitFiles(w, principalFrom(r))
+	if !ok {
+		return
+	}
+	defer release()
 	_, rc, err := st.Open(r.Context(), f.ID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "api_error", "storage_unavailable", err.Error())

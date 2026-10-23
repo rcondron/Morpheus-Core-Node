@@ -68,11 +68,17 @@ File objects carry the usual fields (`id`, `bytes`, `filename`, `purpose`, `crea
   sha2-256). The CID is checked against real Kubo output in the tests. Every download is re-hashed against that
   CID before a byte reaches you.
 - **Leases.** To store a file, the node uses room under a lease it already holds. Otherwise it buys a lease
-  on the cheapest offer whose quota fits (`storage.providers` can pin the choice to certain providers).
+  on the cheapest offer whose quota fits, after checking the provider serves the listing and takes files that
+  large (`storage.providers` can pin the choice to certain providers).
 - **Renewal.** Before leases run out (`renew_before`), the node buys new ones, enough to cover what each
-  provider holds. When a provider stops selling storage, its files move elsewhere.
+  provider holds. Leases the provider has not acknowledged are re-sent until it does.
+- **Price changes.** If a provider raises its price by more than 25% while a cheaper provider exists, the node
+  moves the files there instead of renewing. Once the current lease has ended it renews anyway, warning you,
+  rather than risk the files. It never pays more than `max_price`. A provider that stops selling storage (seen
+  on three passes in a row) has its files moved elsewhere.
 - **Closing leases.** Leases at providers that no longer hold any of your files are closed early, and ended
-  leases are closed, so stake comes back.
+  leases are closed, so stake comes back. Every hour the node also looks for storage sessions of the wallet it
+  does not know about (say, after a crash while opening one), adopts live ones and closes ended ones.
 - **Audits.** Every `audit_interval` the node asks each provider for the blocks on the path from the root to
   a random byte, with a fresh nonce, and checks them against the CID and size it recorded. A copy that fails
   twice in a row is replaced: the node fetches the file from a healthy copy (or from the failing provider if it
@@ -92,7 +98,8 @@ A lease buys a listing's full quota for its duration, whatever you use. Example:
 | One 24 h lease | ≈ 0.67 MOR, paid to the provider from the lease's stake |
 | Stake escrowed per lease | What the marketplace requires for a 24 h session at that price (`morcore storage providers` shows the lease price; the stake follows the protocol's stake-to-stipend rate). The rest returns when the lease closes. |
 
-`storage.max_stake` caps the MOR escrowed in storage leases at once.
+`storage.max_stake` caps the MOR escrowed in storage leases at once, and `storage.max_price` caps what
+the node pays per GiB-month.
 
 ### Settings
 
@@ -104,8 +111,11 @@ A lease buys a listing's full quota for its duration, whatever you use. Example:
   encrypt = true               # encrypt new files to the wallet key (per file: --public)
   audit_interval = "6h0m0s"
   max_stake = "0"              # cap on MOR escrowed in leases ("0" = none)
+  max_price = "0"              # most MOR per GiB-month to pay ("0" = no cap)
   providers = []               # only use these provider addresses
 ```
+
+`renew_before` may be at most half of `lease`.
 
 ## Selling storage
 
@@ -145,11 +155,15 @@ marketplace's usual rules apply, including the cap on earnings relative to your 
 - **Uploads.** Uploads must fit the user's live quota (all live leases added up) and `max_file_size`. The node
   re-imports every upload and refuses it unless it hashes to the CID the user announced. It then streams the
   DAG into Kubo with `dag/import`, which pins it. Your Kubo settings never change a user's CIDs.
-- **Capacity.** The quota sold across live leases stays under `max_total`, which defaults to Kubo's
-  `Datastore.StorageMax`.
-- **Retention.** Files are kept while leases cover the user, and for `grace` (default 72 h) after the last one
-  ends, then unpinned. If a user stays over their live quota for longer than the grace period, their newest
-  files are unpinned until they fit.
+- **Capacity.** The quota sold, across live leases and approvals not yet attached, stays under `max_total`.
+  It defaults to Kubo's `Datastore.StorageMax`, which is 10 GB on a fresh repo, so raise one or the other for
+  bigger listings (`morcore doctor` warns).
+- **Retention.** Files are kept while leases cover the user, then for a grace period, then unpinned.
+  - The grace period is `grace` (default 72 h), but never longer than the lease time the user paid for in the
+    last week. A five-minute lease, or a lease closed early, does not buy days of free storage.
+  - A user who stays over their live quota for longer than 6 hours (or the grace period, if shorter) has their
+    newest files unpinned until they fit.
+- **Uploads** expire after 15 idle minutes, and uploads in progress do not survive a restart.
 - **Reads and proofs.** These come from local blocks only (`offline=true`), so the node never fetches from the
   network what it claims to hold.
 
@@ -171,21 +185,22 @@ marketplace's usual rules apply, including the cap on earnings relative to your 
 Storage adds `storage.*` methods to MOR-RPC. They use the same TCP transport and JSON envelope as the rest of
 the protocol.
 
-- **Requests** are signed by the user's wallet, the same way as other MOR-RPC params. They are accepted within
-  10 minutes of their timestamp.
-- **Results** come back as `{result, timestamp, signature}`, signed by the provider. The user checks that the
-  signer may act for the provider: the provider address itself, the owner of a provider contract, or a
-  delegate.
+- **Requests** are signed by the user's wallet, the same way as other MOR-RPC params. The signed params include
+  the `method` and the `provider` address, so a request cannot be replayed as another method or to another
+  provider. Requests are accepted within 10 minutes of their timestamp, and each signature is served once.
+- **Results** come back as `{result, request, timestamp, signature}`, signed by the provider. `request` is the
+  keccak256 of the request's signature, binding the result to its request. The user checks that the signer may
+  act for the provider: the provider address itself, the owner of a provider contract, or a delegate.
 
 | Method | Params | Result |
 |---|---|---|
 | `storage.info` | `nonce` | listings and their quotas, `maxFileBytes`, `graceSeconds`, `payment` (`direct`/`any`), `chunkBytes`, the nonce |
 | `storage.attach` | `session` | the user's quota, used bytes and `coveredUntil` |
 | `storage.put.start` | `session` (optional), `cid`, `size`, `label` | `upload` id and `chunkBytes` (no id when the user already stores that CID) |
-| `storage.put.chunk` | `upload`, `offset`, `data` (base64, ≤ 8 MiB) | bytes received |
+| `storage.put.chunk` | `upload`, `offset`, `data` (base64; 1 MiB asked, ≤ 4 MiB accepted) | bytes received |
 | `storage.put.end` | `upload` | receipt: `cid`, `size`, `owner`, `storedAt` |
 | `storage.list` | – | quota, usage, cover and the user's files |
-| `storage.get` | `cid`, `offset`, `length` (≤ 4 MiB) | `data` (base64) |
+| `storage.get` | `cid`, `offset`, `length` (≤ 1 MiB) | `data` (base64): exactly the requested range |
 | `storage.prove` | `cid`, `offset`, `nonce` | the DAG blocks from the root to the leaf holding `offset`, and the nonce |
 | `storage.delete` | `cid` | bytes freed |
 

@@ -43,6 +43,7 @@ type StoreOptions struct {
 	Encrypt       bool
 	AuditInterval time.Duration
 	MaxStake      *big.Int         // cap on MOR staked in live leases (nil or 0: none)
+	MaxPrice      *big.Int         // cap on MOR per GiB-month (nil or 0: none)
 	Providers     []common.Address // only use these providers (empty: any)
 }
 
@@ -85,6 +86,9 @@ type Lease struct {
 	Stake       *big.Int         `json:"stake"`
 	OpenedAt    time.Time        `json:"openedAt"`
 	EndsAt      time.Time        `json:"endsAt"`
+	// Attached is set once the provider registered the lease; the keeper
+	// retries until it has.
+	Attached bool `json:"attached"`
 }
 
 // session rebuilds the consumer session for closing the lease.
@@ -121,6 +125,9 @@ type Store struct {
 	orphans []Orphan                  // provider copies still to delete
 	pending map[common.Address]uint64 // bytes being uploaded, per provider
 	retry   map[string]time.Time      // keeper backoff per provider or file
+	fails   map[string]int            // consecutive failures behind a backoff
+	missing map[common.Address]int    // renewal passes that found no offer from a provider
+	infos   map[common.Address]*providerInfo
 	dirty   bool
 }
 
@@ -130,9 +137,12 @@ func NewStore(opt StoreOptions, w *wallet.Wallet, k *chain.Contracts, market *ma
 	if opt.Replicas < 1 {
 		opt.Replicas = 1
 	}
+	limited := *rpc
+	limited.MaxReplyBytes = maxReplyBytes
 	s := &Store{
-		opt: opt, w: w, k: k, market: market, leaser: leaser, rpc: rpc, bus: bus, log: log,
-		files: map[string]*File{}, leases: map[common.Hash]*Lease{}, pending: map[common.Address]uint64{}, retry: map[string]time.Time{},
+		opt: opt, w: w, k: k, market: market, leaser: leaser, rpc: &limited, bus: bus, log: log,
+		files: map[string]*File{}, leases: map[common.Hash]*Lease{}, pending: map[common.Address]uint64{},
+		retry: map[string]time.Time{}, fails: map[string]int{}, missing: map[common.Address]int{}, infos: map[common.Address]*providerInfo{},
 	}
 	s.load()
 	return s
@@ -150,6 +160,7 @@ type Orphan struct {
 	CID      string         `json:"cid"`
 	Provider common.Address `json:"provider"`
 	Endpoint string         `json:"endpoint"`
+	Since    time.Time      `json:"since"`
 }
 
 func (s *Store) load() {

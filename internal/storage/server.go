@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -29,12 +31,24 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
 )
 
-// Transfer sizes for uploads and downloads.
+// Transfer sizes. One chunk or range is one MOR-RPC message, which must
+// cross the network within the transport's read and write deadlines, so they
+// stay small (as the reference node's 1 MiB upload chunks).
 const (
-	ChunkBytes    = 4 << 20 // upload chunk the server asks for
-	maxChunkBytes = 8 << 20
-	maxReadBytes  = 4 << 20
-	uploadTTL     = time.Hour
+	ChunkBytes    = 1 << 20 // upload chunk the server asks for
+	maxChunkBytes = 4 << 20 // largest chunk accepted
+	maxReadBytes  = 1 << 20 // largest range served by storage.get
+	uploadIdle    = 15 * time.Minute
+	uploadPrefix  = "morcore-upload-"
+	// overQuotaGrace bounds how long files may exceed the live quota: the
+	// excess was never paid for.
+	overQuotaGrace = 6 * time.Hour
+	// paidWindow is how far back paid lease time counts toward the grace
+	// period.
+	paidWindow = 7 * 24 * time.Hour
+	// approvalTTL is how long an approved lease counts against capacity
+	// before its session must be attached.
+	approvalTTL = 10 * time.Minute
 )
 
 // Kubo is the provider's IPFS node (its RPC API; *kubo.Client).
@@ -56,12 +70,13 @@ type ServerOptions struct {
 	AcceptStipend bool
 	Gateway       string
 	StatePath     string
+	TempDir       string // spool for uploads (default: the OS temp dir)
 	Version       string
 }
 
 // Server sells IPFS storage: users attach marketplace sessions on storage
-// listings as leases, and their files stay pinned while a lease (plus the
-// grace period) covers them.
+// listings as leases, and their files stay pinned while a lease (plus a
+// grace period earned by the time paid for) covers them.
 type Server struct {
 	opt  ServerOptions
 	w    *wallet.Wallet
@@ -73,13 +88,23 @@ type Server struct {
 	// (its own address or a contract it owns).
 	servesFor func(ctx context.Context, provider common.Address) bool
 
-	mu       sync.Mutex
-	quotas   map[common.Hash]uint64
-	accounts map[common.Address]*account
-	refs     map[string]int // cid → owners
-	uploads  map[string]*pending
-	healthy  bool
-	dirty    bool
+	mu        sync.Mutex
+	quotas    map[common.Hash]uint64
+	accounts  map[common.Address]*account
+	refs      map[string]int // cid → owners
+	uploads   map[string]*pending
+	approvals []approval
+	seen      map[string]int64 // request hashes already served → expiry (unix)
+	lookups   lookupLimiter
+	healthy   bool
+	dirty     bool
+}
+
+type approval struct {
+	user    common.Address
+	listing common.Hash
+	quota   uint64
+	at      time.Time
 }
 
 type account struct {
@@ -99,6 +124,7 @@ type fileRec struct {
 type leaseRec struct {
 	Listing common.Hash `json:"listing"`
 	Quota   uint64      `json:"quota"`
+	Opened  int64       `json:"openedAt"`
 	EndsAt  int64       `json:"endsAt"`
 	Closed  int64       `json:"closedAt,omitempty"`
 	checked time.Time
@@ -112,14 +138,15 @@ func (l *leaseRec) end() int64 {
 }
 
 type pending struct {
-	mu       sync.Mutex // orders the chunks of one upload
+	mu       sync.Mutex // orders the chunks of one upload and its end
 	user     common.Address
 	cid      string
 	size     uint64
 	label    string
 	received uint64
 	f        *os.File
-	created  time.Time
+	last     time.Time // last activity (guarded by Server.mu)
+	ending   bool      // put.end in progress (guarded by Server.mu)
 }
 
 // NewServer builds the storage service. servesFor is the provider's own
@@ -128,7 +155,17 @@ func NewServer(opt ServerOptions, w *wallet.Wallet, k *chain.Contracts, kubo Kub
 	s := &Server{
 		opt: opt, w: w, k: k, kubo: kubo, servesFor: servesFor, bus: bus, log: log,
 		quotas: map[common.Hash]uint64{}, accounts: map[common.Address]*account{},
-		refs: map[string]int{}, uploads: map[string]*pending{}, healthy: true,
+		refs: map[string]int{}, uploads: map[string]*pending{}, seen: map[string]int64{},
+		lookups: lookupLimiter{rate: 2, burst: 20}, healthy: true,
+	}
+	if opt.TempDir != "" {
+		_ = os.MkdirAll(opt.TempDir, 0o700)
+		// Uploads do not survive a restart: clear what an earlier run left.
+		if old, err := filepath.Glob(filepath.Join(opt.TempDir, uploadPrefix+"*")); err == nil {
+			for _, f := range old {
+				os.Remove(f)
+			}
+		}
 	}
 	s.load()
 	return s
@@ -147,6 +184,32 @@ func (a *account) coverage(now int64) (quota uint64, until int64) {
 		}
 	}
 	return quota, until
+}
+
+// grace is how long files outlive the last lease: the configured grace
+// period, but no longer than the lease time paid for in the last week, so
+// a short (or early-closed) lease cannot buy days of free storage.
+func (a *account) grace(limit time.Duration, now time.Time) time.Duration {
+	var paid time.Duration
+	cutoff := now.Add(-paidWindow).Unix()
+	for _, l := range a.Leases {
+		start, end := l.Opened, l.end()
+		if end <= cutoff {
+			continue
+		}
+		start = max64(start, cutoff)
+		if end > start {
+			paid += time.Duration(end-start) * time.Second
+		}
+	}
+	return min(limit, paid)
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // pruneLeases forgets leases that ended before cutoff, keeping the latest so
@@ -200,15 +263,6 @@ func (a *account) used() uint64 {
 	return n
 }
 
-func (s *Server) acct(user common.Address) *account {
-	a := s.accounts[user]
-	if a == nil {
-		a = &account{Files: map[string]*fileRec{}, Leases: map[common.Hash]*leaseRec{}}
-		s.accounts[user] = a
-	}
-	return a
-}
-
 // Serves reports whether a listing is a storage product of this node.
 func (s *Server) Serves(listing common.Hash) bool {
 	for _, l := range s.opt.Listings {
@@ -219,7 +273,9 @@ func (s *Server) Serves(listing common.Hash) bool {
 	return false
 }
 
-// Admit decides whether to approve a new session on a storage listing.
+// Admit decides whether to approve a new session on a storage listing. Quota
+// already sold (live leases, and approvals not attached yet) plus this lease
+// must fit the capacity.
 func (s *Server) Admit(ctx context.Context, listing common.Hash, user common.Address) error {
 	quota, err := s.quota(ctx, listing)
 	if err != nil {
@@ -230,22 +286,36 @@ func (s *Server) Admit(ctx context.Context, listing common.Hash, user common.Add
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.opt.MaxTotal == 0 {
-		return nil
+	now := time.Now()
+	s.pruneApprovalsLocked(now)
+	if s.opt.MaxTotal > 0 {
+		if quota > s.opt.MaxTotal {
+			return fmt.Errorf("this listing's %s quota exceeds the provider's %s storage capacity", config.FormatBytes(quota), config.FormatBytes(s.opt.MaxTotal))
+		}
+		var committed uint64
+		for _, a := range s.accounts {
+			q, _ := a.coverage(now.Unix())
+			committed += q
+		}
+		for _, ap := range s.approvals {
+			committed += ap.quota
+		}
+		if committed+quota > s.opt.MaxTotal {
+			return errors.New("provider storage is fully committed")
+		}
 	}
-	now := time.Now().Unix()
-	var committed uint64
-	for _, a := range s.accounts {
-		q, _ := a.coverage(now)
-		committed += q
-	}
-	if quota > s.opt.MaxTotal {
-		return fmt.Errorf("this listing's %s quota exceeds the provider's %s storage capacity", config.FormatBytes(quota), config.FormatBytes(s.opt.MaxTotal))
-	}
-	if committed+quota > s.opt.MaxTotal {
-		return errors.New("provider storage is fully committed")
-	}
+	s.approvals = append(s.approvals, approval{user: user, listing: listing, quota: quota, at: now})
 	return nil
+}
+
+func (s *Server) pruneApprovalsLocked(now time.Time) {
+	kept := s.approvals[:0]
+	for _, ap := range s.approvals {
+		if now.Sub(ap.at) < approvalTTL {
+			kept = append(kept, ap)
+		}
+	}
+	s.approvals = kept
 }
 
 // quota returns the per-session bytes of a served listing (from its tags).
@@ -273,11 +343,25 @@ func (s *Server) quota(ctx context.Context, listing common.Hash) (uint64, error)
 	return q, nil
 }
 
-// Handle serves the storage.* methods.
+// Handle serves the storage.* methods. Requests must name this provider and
+// are served once: a replayed signature is refused.
 func (s *Server) Handle(ctx context.Context, msg *morrpc.RPCMessage, remote string, send func(*morrpc.RPCResponse) error) error {
 	req, user, _, err := morrpc.VerifyStorageRequest(msg)
 	if err != nil {
 		return err
+	}
+	if !s.servesFor(ctx, common.HexToAddress(req.Provider)) {
+		return errors.New("storage request is for another provider")
+	}
+	hash := morrpc.RequestHash(req.Signature)
+	s.mu.Lock()
+	_, replayed := s.seen[hash]
+	if !replayed {
+		s.seen[hash] = time.Now().Add(morrpc.StorageWindow + 3*time.Minute).Unix()
+	}
+	s.mu.Unlock()
+	if replayed {
+		return errors.New("storage request was already served")
 	}
 	var result any
 	switch msg.Method {
@@ -305,7 +389,7 @@ func (s *Server) Handle(ctx context.Context, msg *morrpc.RPCMessage, remote stri
 	if err != nil {
 		return err
 	}
-	res, err := morrpc.StorageResponse(msg.ID, result, s.w)
+	res, err := morrpc.StorageResponse(msg.ID, result, hash, s.w)
 	if err != nil {
 		return err
 	}
@@ -345,9 +429,13 @@ func (s *Server) attachLease(ctx context.Context, user common.Address, session s
 	id := common.HexToHash(session)
 	s.mu.Lock()
 	known := s.accounts[user] != nil && s.accounts[user].Leases[id] != nil
+	allowed := known || s.lookups.allow(time.Now())
 	s.mu.Unlock()
 	if known {
 		return nil
+	}
+	if !allowed {
+		return errors.New("provider is busy checking sessions; retry shortly")
 	}
 	cs, err := s.k.GetSession(ctx, id)
 	if err != nil {
@@ -375,17 +463,32 @@ func (s *Server) attachLease(ctx context.Context, user common.Address, session s
 		return err
 	}
 	s.mu.Lock()
-	s.acct(user).Leases[id] = &leaseRec{Listing: listing, Quota: quota, EndsAt: cs.EndsAtTime().Unix(), checked: time.Now()}
+	a := s.accounts[user]
+	if a == nil {
+		a = &account{Files: map[string]*fileRec{}, Leases: map[common.Hash]*leaseRec{}}
+		s.accounts[user] = a
+	}
+	a.Leases[id] = &leaseRec{Listing: listing, Quota: quota, Opened: cs.OpenedAt.Int64(), EndsAt: cs.EndsAtTime().Unix(), checked: time.Now()}
+	for i, ap := range s.approvals {
+		if ap.user == user && ap.listing == listing {
+			s.approvals = append(s.approvals[:i], s.approvals[i+1:]...)
+			break
+		}
+	}
 	s.dirty = true
 	s.mu.Unlock()
 	s.log.Info("storage lease attached", "user", user.Hex(), "session", id.Hex(), "quota", quota)
 	return nil
 }
 
+// standing reports a user's quota, usage and cover (zero for strangers).
 func (s *Server) standing(user common.Address) morrpc.StorageAccount {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	a := s.acct(user)
+	a := s.accounts[user]
+	if a == nil {
+		return morrpc.StorageAccount{}
+	}
 	quota, until := a.coverage(time.Now().Unix())
 	return morrpc.StorageAccount{QuotaBytes: quota, UsedBytes: a.used() + s.reservedLocked(user), CoveredUntil: until}
 }
@@ -414,54 +517,67 @@ func (s *Server) putStart(ctx context.Context, user common.Address, req *morrpc.
 	case req.Size == 0:
 		return nil, errors.New("empty files cannot be stored")
 	case s.opt.MaxFileBytes > 0 && req.Size > s.opt.MaxFileBytes:
-		return nil, fmt.Errorf("file is larger than this provider's limit (%d bytes)", s.opt.MaxFileBytes)
+		return nil, fmt.Errorf("file is larger than this provider's limit (%s)", config.FormatBytes(s.opt.MaxFileBytes))
 	case len(req.Label) > 512:
 		return nil, errors.New("label is too long")
 	}
-	s.mu.Lock()
-	a := s.acct(user)
-	if f := a.Files[c.String()]; f != nil {
-		s.mu.Unlock()
-		return morrpc.StorageUpload{Received: f.Size, ChunkBytes: ChunkBytes}, nil // already stored
-	}
-	quota, _ := a.coverage(time.Now().Unix())
-	if used := a.used() + s.reservedLocked(user); used+req.Size > quota {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("over quota: %d of %d bytes used; attach another storage session", used, quota)
-	}
-	s.mu.Unlock()
-	f, err := os.CreateTemp("", "morcore-store-*")
+	f, err := os.CreateTemp(s.opt.TempDir, uploadPrefix+"*")
 	if err != nil {
 		return nil, err
 	}
+	// The quota check and the reservation happen under one lock, so
+	// concurrent uploads cannot both claim the same room.
+	s.mu.Lock()
+	a := s.accounts[user]
+	var quota, used uint64
+	if a != nil {
+		if rec := a.Files[c.String()]; rec != nil {
+			s.mu.Unlock()
+			drop(f)
+			return morrpc.StorageUpload{Received: rec.Size, ChunkBytes: ChunkBytes}, nil // already stored
+		}
+		quota, _ = a.coverage(time.Now().Unix())
+		used = a.used() + s.reservedLocked(user)
+	}
+	if req.Size > quota || used > quota-req.Size {
+		s.mu.Unlock()
+		drop(f)
+		if quota == 0 {
+			return nil, errors.New("no storage lease covers this wallet here; attach a storage session first")
+		}
+		return nil, fmt.Errorf("over quota: %s of %s used; attach another storage session", config.FormatBytes(used), config.FormatBytes(quota))
+	}
 	idb := make([]byte, 16)
 	_, _ = rand.Read(idb)
-	up := &pending{user: user, cid: c.String(), size: req.Size, label: req.Label, f: f, created: time.Now()}
 	id := hex.EncodeToString(idb)
-	s.mu.Lock()
-	s.uploads[id] = up
+	s.uploads[id] = &pending{user: user, cid: c.String(), size: req.Size, label: req.Label, f: f, last: time.Now()}
 	s.mu.Unlock()
 	return morrpc.StorageUpload{Upload: id, ChunkBytes: ChunkBytes}, nil
 }
 
+// upload finds a user's upload and marks it active.
 func (s *Server) upload(user common.Address, id string) (*pending, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	up := s.uploads[id]
 	if up == nil || up.user != user {
-		return nil, errors.New("unknown upload")
+		return nil, errors.New("unknown upload (uploads expire after 15 idle minutes)")
 	}
+	up.last = time.Now()
 	return up, nil
 }
 
+// dropUpload forgets an upload and removes its spool file once no chunk or
+// end is using it.
 func (s *Server) dropUpload(id string) {
 	s.mu.Lock()
 	up := s.uploads[id]
 	delete(s.uploads, id)
 	s.mu.Unlock()
 	if up != nil {
-		up.f.Close()
-		os.Remove(up.f.Name())
+		up.mu.Lock()
+		drop(up.f)
+		up.mu.Unlock()
 	}
 }
 
@@ -481,7 +597,7 @@ func (s *Server) putChunk(user common.Address, req *morrpc.StorageReq) (any, err
 		return nil, fmt.Errorf("expected offset %d, got %d", up.received, req.Offset)
 	case len(data) == 0 || len(data) > maxChunkBytes:
 		return nil, errors.New("invalid chunk size")
-	case up.received+uint64(len(data)) > up.size:
+	case uint64(len(data)) > up.size-up.received:
 		return nil, errors.New("chunk exceeds the declared size")
 	}
 	if _, err := up.f.Write(data); err != nil {
@@ -499,6 +615,13 @@ func (s *Server) putEnd(ctx context.Context, user common.Address, req *morrpc.St
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	if up.ending {
+		s.mu.Unlock()
+		return nil, errors.New("this upload is already being stored")
+	}
+	up.ending = true
+	s.mu.Unlock()
 	defer s.dropUpload(req.Upload)
 	up.mu.Lock()
 	defer up.mu.Unlock()
@@ -531,7 +654,11 @@ func (s *Server) putEnd(ctx context.Context, user common.Address, req *morrpc.St
 	}
 	now := time.Now().Unix()
 	s.mu.Lock()
-	a := s.acct(user)
+	a := s.accounts[user]
+	if a == nil { // the account expired during the upload
+		a = &account{Files: map[string]*fileRec{}, Leases: map[common.Hash]*leaseRec{}}
+		s.accounts[user] = a
+	}
 	if a.Files[up.cid] == nil {
 		a.Files[up.cid] = &fileRec{Size: up.size, Label: up.label, StoredAt: now}
 		s.refs[up.cid]++
@@ -563,8 +690,10 @@ func (s *Server) owned(user common.Address, cid string) (*fileRec, error) {
 func (s *Server) list(user common.Address) (any, error) {
 	out := morrpc.StorageList{StorageAccount: s.standing(user), Files: []morrpc.StorageFile{}}
 	s.mu.Lock()
-	for cid, f := range s.acct(user).Files {
-		out.Files = append(out.Files, morrpc.StorageFile{CID: cid, Size: f.Size, Label: f.Label, StoredAt: f.StoredAt})
+	if a := s.accounts[user]; a != nil {
+		for cid, f := range a.Files {
+			out.Files = append(out.Files, morrpc.StorageFile{CID: cid, Size: f.Size, Label: f.Label, StoredAt: f.StoredAt})
+		}
 	}
 	s.mu.Unlock()
 	sort.Slice(out.Files, func(i, j int) bool { return out.Files[i].StoredAt < out.Files[j].StoredAt })
@@ -590,6 +719,9 @@ func (s *Server) get(ctx context.Context, user common.Address, req *morrpc.Stora
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, int64(length)))
+	if err == nil && uint64(len(data)) != length {
+		err = io.ErrUnexpectedEOF
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read from IPFS: %w", err)
 	}
@@ -624,27 +756,36 @@ func (s *Server) delete(ctx context.Context, user common.Address, req *morrpc.St
 		return nil, err
 	}
 	c, _ := ipfs.Parse(req.CID)
-	s.unpin(ctx, user, c.String())
+	s.mu.Lock()
+	unpin := s.dropFilesLocked(user, []string{c.String()})
+	s.mu.Unlock()
+	s.pinRm(ctx, unpin)
 	return morrpc.StorageDeleted{CID: req.CID, FreedBytes: f.Size}, nil
 }
 
-// unpin drops a user's file and unpins it once no user holds it.
-func (s *Server) unpin(ctx context.Context, user common.Address, cid string) {
-	s.mu.Lock()
+// dropFilesLocked removes files from a user's account and returns the CIDs
+// no user holds any more, to unpin.
+func (s *Server) dropFilesLocked(user common.Address, cids []string) (unpin []string) {
 	a := s.accounts[user]
-	if a == nil || a.Files[cid] == nil {
-		s.mu.Unlock()
-		return
+	if a == nil {
+		return nil
 	}
-	delete(a.Files, cid)
-	s.refs[cid]--
-	last := s.refs[cid] <= 0
-	if last {
-		delete(s.refs, cid)
+	for _, cid := range cids {
+		if a.Files[cid] == nil {
+			continue
+		}
+		delete(a.Files, cid)
+		if s.refs[cid]--; s.refs[cid] <= 0 {
+			delete(s.refs, cid)
+			unpin = append(unpin, cid)
+		}
+		s.dirty = true
 	}
-	s.dirty = true
-	s.mu.Unlock()
-	if last {
+	return unpin
+}
+
+func (s *Server) pinRm(ctx context.Context, cids []string) {
+	for _, cid := range cids {
 		if err := s.kubo.PinRm(ctx, cid); err != nil {
 			s.log.Warn("could not unpin", "cid", cid, "err", err)
 		}
@@ -674,6 +815,15 @@ func (s *Server) Run(ctx context.Context) {
 		s.save()
 		select {
 		case <-ctx.Done():
+			s.mu.Lock()
+			ids := make([]string, 0, len(s.uploads))
+			for id := range s.uploads {
+				ids = append(ids, id)
+			}
+			s.mu.Unlock()
+			for _, id := range ids {
+				s.dropUpload(id)
+			}
 			s.save()
 			return
 		case <-tick.C:
@@ -682,19 +832,25 @@ func (s *Server) Run(ctx context.Context) {
 }
 
 func (s *Server) housekeep(ctx context.Context) {
+	now := time.Now()
 	s.mu.Lock()
 	var stale []string
 	for id, up := range s.uploads {
-		if time.Since(up.created) > uploadTTL {
+		if !up.ending && now.Sub(up.last) > uploadIdle {
 			stale = append(stale, id)
 		}
 	}
+	for h, exp := range s.seen {
+		if now.Unix() > exp {
+			delete(s.seen, h)
+		}
+	}
+	s.pruneApprovalsLocked(now)
 	type check struct {
 		user common.Address
 		id   common.Hash
 	}
 	var checks []check
-	now := time.Now()
 	for user, a := range s.accounts {
 		for id, l := range a.Leases {
 			if l.Closed == 0 && now.Unix() < l.EndsAt && now.Sub(l.checked) > 30*time.Minute {
@@ -713,32 +869,50 @@ func (s *Server) housekeep(ctx context.Context) {
 			continue
 		}
 		s.mu.Lock()
-		if l := s.accounts[c.user].Leases[c.id]; l != nil {
-			l.checked = now
-			if cs.Closed() && cs.ClosedAt != nil {
-				l.Closed = cs.ClosedAt.Int64()
+		if a := s.accounts[c.user]; a != nil {
+			if l := a.Leases[c.id]; l != nil {
+				l.checked = now
+				if cs.Closed() && cs.ClosedAt != nil {
+					l.Closed = cs.ClosedAt.Int64()
+				}
+				s.dirty = true
 			}
-			s.dirty = true
 		}
 		s.mu.Unlock()
 	}
-	// Coverage plus grace over: unpin and forget. Files over the live
-	// quota for longer than the grace period go too, newest first, so a
-	// small renewal cannot keep a large upload.
-	s.mu.Lock()
-	var expired []common.Address
-	type drop struct {
-		user common.Address
-		cids []string
+	// Coverage plus grace over: unpin and forget. Files over the live quota
+	// for longer than overQuotaGrace go too, newest first, so a small
+	// renewal cannot keep a large upload. Accounts are changed and removed
+	// in one critical section, so uploads or attaches racing with expiry
+	// are either kept or never counted.
+	type note struct {
+		user    common.Address
+		files   int
+		expired bool
 	}
-	var over []drop
+	var notes []note
+	var unpin []string
+	s.mu.Lock()
 	for user, a := range s.accounts {
 		quota, until := a.coverage(now.Unix())
-		if len(a.Leases) > 0 && now.After(time.Unix(until, 0).Add(s.opt.Grace)) {
-			expired = append(expired, user)
+		grace := a.grace(s.opt.Grace, now)
+		lapsed := len(a.Leases) == 0 || !now.Before(time.Unix(until, 0).Add(grace))
+		if lapsed {
+			cids := make([]string, 0, len(a.Files))
+			for cid := range a.Files {
+				cids = append(cids, cid)
+			}
+			unpin = append(unpin, s.dropFilesLocked(user, cids)...)
+			if !s.uploadingLocked(user) {
+				delete(s.accounts, user)
+			}
+			s.dirty = true
+			if len(cids) > 0 {
+				notes = append(notes, note{user, len(cids), true})
+			}
 			continue
 		}
-		if a.pruneLeases(now.Add(-s.opt.Grace).Unix()) {
+		if a.pruneLeases(now.Add(-paidWindow).Unix()) {
 			s.dirty = true
 		}
 		used := a.used()
@@ -749,41 +923,58 @@ func (s *Server) housekeep(ctx context.Context) {
 			}
 		case a.OverSince == 0:
 			a.OverSince, s.dirty = now.Unix(), true
-		case now.After(time.Unix(a.OverSince, 0).Add(s.opt.Grace)):
-			over = append(over, drop{user, a.newestBeyond(quota)})
+		case now.After(time.Unix(a.OverSince, 0).Add(min(grace, overQuotaGrace))):
+			cids := a.newestBeyond(quota)
+			unpin = append(unpin, s.dropFilesLocked(user, cids)...)
+			notes = append(notes, note{user, len(cids), false})
 		}
 	}
 	s.mu.Unlock()
-	for _, d := range over {
-		for _, cid := range d.cids {
-			s.unpin(ctx, d.user, cid)
-		}
-		s.log.Info("storage over quota past the grace period; files unpinned", "user", d.user.Hex(), "files", len(d.cids))
-		s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s stayed over quota: %d file(s) unpinned", short(d.user.Hex()), len(d.cids)))
-	}
-	for _, user := range expired {
-		s.mu.Lock()
-		var cids []string
-		for cid := range s.accounts[user].Files {
-			cids = append(cids, cid)
-		}
-		s.mu.Unlock()
-		for _, cid := range cids {
-			s.unpin(ctx, user, cid)
-		}
-		s.mu.Lock()
-		delete(s.accounts, user)
-		s.dirty = true
-		s.mu.Unlock()
-		if len(cids) > 0 {
-			s.log.Info("storage lease lapsed; files unpinned", "user", user.Hex(), "files", len(cids))
-			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("lease of %s lapsed: %d file(s) unpinned", short(user.Hex()), len(cids)))
+	s.pinRm(ctx, unpin)
+	for _, n := range notes {
+		if n.expired {
+			s.log.Info("storage lease lapsed; files unpinned", "user", n.user.Hex(), "files", n.files)
+			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("lease of %s lapsed: %d file(s) unpinned", short(n.user.Hex()), n.files))
+		} else {
+			s.log.Info("storage over quota past the grace period; files unpinned", "user", n.user.Hex(), "files", n.files)
+			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s stayed over quota: %d file(s) unpinned", short(n.user.Hex()), n.files))
 		}
 	}
 	_, err := s.kubo.Version(ctx)
 	s.mu.Lock()
 	s.healthy = err == nil
 	s.mu.Unlock()
+}
+
+func (s *Server) uploadingLocked(user common.Address) bool {
+	for _, up := range s.uploads {
+		if up.user == user {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupLimiter bounds the chain reads strangers can trigger by attaching
+// unknown sessions (a token bucket; guarded by Server.mu).
+type lookupLimiter struct {
+	rate, burst float64
+	tokens      float64
+	at          time.Time
+}
+
+func (l *lookupLimiter) allow(now time.Time) bool {
+	if l.at.IsZero() {
+		l.tokens = l.burst
+	} else {
+		l.tokens = min(l.burst, l.tokens+now.Sub(l.at).Seconds()*l.rate)
+	}
+	l.at = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
 }
 
 // ServerStats summarize the provider's storage service for status displays.
@@ -854,6 +1045,8 @@ func (s *Server) load() {
 	}
 }
 
+// save writes the state when it changed; the file is written outside the
+// lock.
 func (s *Server) save() {
 	if s.opt.StatePath == "" {
 		return
@@ -863,13 +1056,16 @@ func (s *Server) save() {
 		s.mu.Unlock()
 		return
 	}
-	st := serverState{Version: 1, Accounts: s.accounts}
-	err := store.WriteJSON(s.opt.StatePath, st, 0o600)
-	if err == nil {
-		s.dirty = false
-	}
+	data, err := json.MarshalIndent(serverState{Version: 1, Accounts: s.accounts}, "", "  ")
+	s.dirty = err != nil
 	s.mu.Unlock()
+	if err == nil {
+		err = store.WriteFile(s.opt.StatePath, data, 0o600)
+	}
 	if err != nil {
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
 		s.log.Warn("could not save storage state", "err", err)
 	}
 }

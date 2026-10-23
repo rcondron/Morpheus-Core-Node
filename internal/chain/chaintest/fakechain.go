@@ -173,6 +173,14 @@ func (c *Chain) Session(id common.Hash) *chain.Session {
 	return &cp
 }
 
+// SetMaxDuration changes the longest session the marketplace grants, in
+// seconds.
+func (c *Chain) SetMaxDuration(sec int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.MaxDuration = sec
+}
+
 // ExpireSession moves a session's end into the past.
 func (c *Chain) ExpireSession(id common.Hash) {
 	c.mu.Lock()

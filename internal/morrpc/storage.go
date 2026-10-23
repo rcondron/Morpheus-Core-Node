@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // Storage methods: a morcore extension that sells IPFS storage through
@@ -28,7 +29,11 @@ const (
 const StorageWindow = 10 * time.Minute
 
 // StorageReq is the request for every storage method; each uses a subset.
+// Method and Provider are signed with the rest, so a request can neither be
+// replayed as another method nor sent to another provider.
 type StorageReq struct {
+	Method    string    `json:"method"`
+	Provider  string    `json:"provider"`          // 0x address of the provider it is for
 	Session   string    `json:"session,omitempty"` // 0x session id (attach, put)
 	Upload    string    `json:"upload,omitempty"`
 	CID       string    `json:"cid,omitempty"`
@@ -42,30 +47,45 @@ type StorageReq struct {
 	Signature HexString `json:"signature,omitempty"`
 }
 
-// StorageRes carries a method's result, signed by the provider.
+// StorageRes carries a method's result, signed by the provider. Request is
+// the hash of the request's signature, binding the result to the request.
 type StorageRes struct {
 	Result    json.RawMessage `json:"result"`
+	Request   string          `json:"request"`
 	Timestamp uint64          `json:"timestamp"`
 	Signature HexString       `json:"signature,omitempty"`
 }
 
-// StorageRequest signs a storage request.
-func StorageRequest(id, method string, p StorageReq, s Signer) (*RPCMessage, error) {
+// RequestHash identifies a signed request: the keccak256 of its signature.
+func RequestHash(sig HexString) string { return common.BytesToHash(crypto.Keccak256(sig)).Hex() }
+
+// StorageRequest signs a storage request for provider and returns it with
+// its RequestHash, which the result must echo.
+func StorageRequest(id, method string, provider common.Address, p StorageReq, s Signer) (*RPCMessage, string, error) {
+	p.Method, p.Provider = method, provider.Hex()
 	p.Timestamp, p.Signature = Now(), nil
 	sig, err := SignParams(p, s)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	p.Signature = sig
-	return newMessage(id, method, p)
+	msg, err := newMessage(id, method, p)
+	return msg, RequestHash(sig), err
 }
 
-// VerifyStorageRequest decodes a storage request, checks its freshness and
-// returns it with the signer's address and public key.
+// VerifyStorageRequest decodes a storage request, checks it was signed for
+// this method and is fresh, and returns it with the signer's address and
+// public key. The caller checks Provider and that the signature is new.
 func VerifyStorageRequest(msg *RPCMessage) (*StorageReq, common.Address, []byte, error) {
 	var p StorageReq
 	if err := json.Unmarshal(msg.Params, &p); err != nil {
 		return nil, common.Address{}, nil, fmt.Errorf("invalid storage request: %w", err)
+	}
+	if p.Method != msg.Method {
+		return nil, common.Address{}, nil, errors.New("storage request was signed for another method")
+	}
+	if !common.IsHexAddress(p.Provider) {
+		return nil, common.Address{}, nil, errors.New("storage request names no provider")
 	}
 	ts := time.UnixMilli(int64(p.Timestamp))
 	if d := time.Since(ts); d > StorageWindow || d < -2*time.Minute {
@@ -81,13 +101,13 @@ func VerifyStorageRequest(msg *RPCMessage) (*StorageReq, common.Address, []byte,
 	return &p, addr, pub, nil
 }
 
-// StorageResponse signs a storage result.
-func StorageResponse(id string, result any, s Signer) (*RPCResponse, error) {
+// StorageResponse signs a storage result for the request with requestHash.
+func StorageResponse(id string, result any, requestHash string, s Signer) (*RPCResponse, error) {
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
 	}
-	p := StorageRes{Result: raw, Timestamp: Now()}
+	p := StorageRes{Result: raw, Request: requestHash, Timestamp: Now()}
 	sig, err := SignParams(p, s)
 	if err != nil {
 		return nil, err
@@ -96,33 +116,37 @@ func StorageResponse(id string, result any, s Signer) (*RPCResponse, error) {
 	return newResult(id, p)
 }
 
-// VerifyStorageResponse checks a storage result was signed by a key allowed
-// to act for the provider and decodes it into out.
-func VerifyStorageResponse(res *RPCResponse, authorize func(signer common.Address) error, out any) error {
+// VerifyStorageResponse checks a storage result answers the request with
+// requestHash, was signed by a key allowed to act for the provider, and
+// decodes it into out. It returns the signer's public key.
+func VerifyStorageResponse(res *RPCResponse, requestHash string, authorize func(signer common.Address) error, out any) ([]byte, error) {
 	if err := ResponseError(res, nil, nil); err != nil {
-		return err
+		return nil, err
 	}
 	raw, err := resultOf(res)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var r StorageRes
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return fmt.Errorf("invalid storage response: %w", err)
+		return nil, fmt.Errorf("invalid storage response: %w", err)
 	}
 	sig := r.Signature
 	r.Signature = nil
-	_, signer, err := RecoverParams(r, sig)
+	pub, signer, err := RecoverParams(r, sig)
 	if err != nil {
-		return fmt.Errorf("%w on storage response", ErrInvalidSignature)
+		return nil, fmt.Errorf("%w on storage response", ErrInvalidSignature)
+	}
+	if r.Request != requestHash {
+		return nil, errors.New("storage response answers another request")
 	}
 	if err := authorize(signer); err != nil {
-		return err
+		return nil, err
 	}
 	if out == nil {
-		return nil
+		return pub, nil
 	}
-	return json.Unmarshal(r.Result, out)
+	return pub, json.Unmarshal(r.Result, out)
 }
 
 // Storage results.

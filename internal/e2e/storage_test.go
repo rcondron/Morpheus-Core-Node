@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/rcondron/Morpheus-Core-Node/internal/apikeys"
+	"github.com/rcondron/Morpheus-Core-Node/internal/chain/chaintest"
 	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs"
 	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/kubo"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
@@ -182,13 +183,16 @@ func TestStorageFilesAPI(t *testing.T) {
 }
 
 // TestStorageLeaseRenewal checks the keeper buys the next lease before the
-// current one runs out, and that public files are stored as they are.
+// current one runs out, once, and that public files are stored as they are.
 func TestStorageLeaseRenewal(t *testing.T) {
 	h := storageHarness(t)
 	ctx := context.Background()
 	st := storage.NewStore(storage.StoreOptions{
-		Path: h.dir + "/renew.json", TempDir: h.dir + "/tmp", Lease: time.Hour, RenewBefore: 2 * time.Hour, Replicas: 1, Encrypt: true,
+		Path: h.dir + "/renew.json", TempDir: h.dir + "/tmp", Lease: time.Hour, RenewBefore: 30 * time.Minute, Replicas: 1, Encrypt: true,
 	}, h.consumer, h.ck, h.market, h.mgr, morrpc.DefaultClient(), h.bus, logger())
+	// The marketplace grants 20 minutes at first, so the first lease ends
+	// inside the renewal window.
+	h.fc.SetMaxDuration(20 * 60)
 	data := []byte(strings.Repeat("public dataset row\n", 20000))
 	f, err := st.Put(ctx, bytes.NewReader(data), storage.PutOptions{Name: "rows.txt", ContentType: "text/plain", Public: true})
 	if err != nil {
@@ -201,13 +205,13 @@ func TestStorageLeaseRenewal(t *testing.T) {
 	if want, _, _ := ipfs.Import(bytes.NewReader(data), nil); want != root {
 		t.Fatalf("public file cid %s, plain bytes hash to %s", root, want)
 	}
-	if len(st.Leases()) != 1 {
-		t.Fatalf("leases before renewal: %d", len(st.Leases()))
+	if l := st.Leases(); len(l) != 1 || !l[0].Attached || time.Until(l[0].EndsAt) > 21*time.Minute {
+		t.Fatalf("first lease: %+v", l)
 	}
-	// With the renewal window longer than a lease, every pass buys the next.
+	h.fc.SetMaxDuration(86400)
 	st.Maintain(ctx)
 	leases := st.Leases()
-	if len(leases) != 2 || leases[0].Session == leases[1].Session || leases[0].Provider != leases[1].Provider {
+	if len(leases) != 2 || leases[0].Session == leases[1].Session || leases[0].Provider != leases[1].Provider || !leases[1].Attached {
 		t.Fatalf("leases after renewal: %+v", leases)
 	}
 	for _, l := range leases {
@@ -215,9 +219,31 @@ func TestStorageLeaseRenewal(t *testing.T) {
 			t.Fatalf("lease %s on chain: %+v", l.Session.Hex(), cs)
 		}
 	}
-	// Deleting the last file leaves the leases to be closed by the keeper
-	// (after a short delay), returning their stake.
+	// The new lease covers the window: another pass buys nothing.
+	st.Maintain(ctx)
+	if n := len(st.Leases()); n != 2 {
+		t.Fatalf("%d leases after a second pass", n)
+	}
 	if err := st.Delete(ctx, f.ID); err != nil || h.kubo.Pinned(root) {
 		t.Fatalf("delete: %v pinned=%v", err, h.kubo.Pinned(root))
+	}
+}
+
+// TestStoragePriceCap checks storage.max_price keeps the node off providers
+// that charge more.
+func TestStoragePriceCap(t *testing.T) {
+	h := storageHarness(t)
+	ctx := context.Background()
+	// The test provider sells 256 MiB for 0.001 MOR/s: about 10,000 MOR per
+	// GiB-month. Cap at 1 MOR.
+	st := storage.NewStore(storage.StoreOptions{
+		Path: h.dir + "/capped.json", TempDir: h.dir + "/tmp", Lease: time.Hour, RenewBefore: 10 * time.Minute, Replicas: 1,
+		MaxPrice: chaintest.MORs(1),
+	}, h.consumer, h.ck, h.market, h.mgr, morrpc.DefaultClient(), h.bus, logger())
+	if _, err := st.Put(ctx, strings.NewReader("too dear"), storage.PutOptions{Name: "x"}); err == nil || !strings.Contains(err.Error(), "no provider sells storage") {
+		t.Fatalf("store above the price cap: %v", err)
+	}
+	if len(st.Leases()) != 0 {
+		t.Fatal("a lease was bought above the price cap")
 	}
 }

@@ -32,7 +32,10 @@ type Client struct {
 	DialTimeout  time.Duration
 	WriteTimeout time.Duration
 	ReplyTimeout time.Duration
-	Dial         func(ctx context.Context, network, addr string) (net.Conn, error)
+	// MaxReplyBytes bounds what a provider may send on one connection (0: no
+	// bound), so a hostile provider cannot exhaust memory.
+	MaxReplyBytes int64
+	Dial          func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // DefaultClient uses the reference node's timeouts.
@@ -113,7 +116,11 @@ func (c *Client) Stream(ctx context.Context, addr string, msg *RPCMessage, first
 	if err := c.send(conn, msg); err != nil {
 		return err
 	}
-	dec := json.NewDecoder(bufio.NewReader(conn))
+	var in io.Reader = conn
+	if c.MaxReplyBytes > 0 {
+		in = io.LimitReader(conn, c.MaxReplyBytes)
+	}
+	dec := json.NewDecoder(bufio.NewReader(in))
 	deadline := firstTimeout
 	received := 0
 	for {

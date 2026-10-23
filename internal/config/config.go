@@ -118,6 +118,7 @@ type StorageConfig struct {
 	Encrypt       bool     `toml:"encrypt"`      // encrypt new files to the wallet key
 	AuditInterval Duration `toml:"audit_interval"`
 	MaxStake      string   `toml:"max_stake"` // cap on MOR escrowed in storage sessions ("0" = none)
+	MaxPrice      string   `toml:"max_price"` // most MOR per GiB-month to pay ("0" = no cap)
 	Providers     []string `toml:"providers"` // optional allowlist of storage providers
 }
 
@@ -240,6 +241,7 @@ func Default(network string) *Config {
 			Encrypt:       true,
 			AuditInterval: D(6 * time.Hour),
 			MaxStake:      "0",
+			MaxPrice:      "0",
 		},
 		Provider: ProviderConfig{
 			Listen: "0.0.0.0:3333",
@@ -452,8 +454,17 @@ func (c *Config) Validate() error {
 	if st.Replicas < 1 {
 		st.Replicas = 1
 	}
+	if st.RenewBefore.Duration <= 0 || st.RenewBefore.Duration > st.Lease.Duration/2 {
+		errs = append(errs, errors.New("storage.renew_before must be positive and at most half of storage.lease"))
+	}
 	if _, err := units.ParseToken(st.MaxStake); err != nil {
 		errs = append(errs, fmt.Errorf("storage.max_stake: %w", err))
+	}
+	if st.MaxPrice == "" {
+		st.MaxPrice = "0"
+	}
+	if _, err := units.ParseToken(st.MaxPrice); err != nil {
+		errs = append(errs, fmt.Errorf("storage.max_price: %w", err))
 	}
 	if ps := c.Provider.Storage; ps.Enabled {
 		if u, err := url.Parse(ps.IPFSAPI); err != nil || u.Host == "" {

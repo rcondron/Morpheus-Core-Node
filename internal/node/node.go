@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -101,6 +102,7 @@ func New(cfg *config.Config, w *wallet.Wallet, log *slog.Logger) (*Node, error) 
 		}, w, k, tx, n.Market, morrpc.DefaultClient(), bus, log.With("component", "sessions"))
 		st := cfg.Storage
 		storageStake, _ := units.ParseToken(st.MaxStake)
+		maxPrice, _ := units.ParseToken(st.MaxPrice)
 		var allow []common.Address
 		for _, a := range st.Providers {
 			allow = append(allow, common.HexToAddress(a))
@@ -108,7 +110,7 @@ func New(cfg *config.Config, w *wallet.Wallet, log *slog.Logger) (*Node, error) 
 		n.Store = storage.NewStore(storage.StoreOptions{
 			Path: cfg.Path(config.StorageFile), TempDir: cfg.Path(config.TempDir), Lease: st.Lease.Duration,
 			RenewBefore: st.RenewBefore.Duration, Replicas: st.Replicas, Encrypt: st.Encrypt,
-			AuditInterval: st.AuditInterval.Duration, MaxStake: storageStake, Providers: allow,
+			AuditInterval: st.AuditInterval.Duration, MaxStake: storageStake, MaxPrice: maxPrice, Providers: allow,
 		}, w, k, n.Market, n.Sessions, morrpc.DefaultClient(), bus, log.With("component", "storage"))
 	}
 	if cfg.ProviderEnabled() {
@@ -130,6 +132,7 @@ func New(cfg *config.Config, w *wallet.Wallet, log *slog.Logger) (*Node, error) 
 			n.Storage = storage.NewServer(storage.ServerOptions{
 				Listings: listings, MaxFileBytes: maxFile, MaxTotal: maxTotal, Grace: ps.Grace.Duration,
 				AcceptStipend: ps.AcceptStipend, Gateway: ps.Gateway, StatePath: cfg.Path(config.StorageState),
+				TempDir: filepath.Join(cfg.Path(config.TempDir), "uploads"),
 				Version: buildinfo.ProtocolVersion(),
 			}, w, k, kc, n.Provider.ServesFor, bus, log.With("component", "storage"))
 			n.Provider.SetStorage(n.Storage)

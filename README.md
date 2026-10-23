@@ -500,11 +500,12 @@ role = "consumer"              # consumer | provider | both
 
 [storage]                      # files you keep on marketplace storage (docs/storage.md)
   lease = "24h0m0s"
-  renew_before = "30m0s"
+  renew_before = "30m0s"       # at most half of lease
   replicas = 1
   encrypt = true
   audit_interval = "6h0m0s"
-  max_stake = "0"
+  max_stake = "0"              # cap on MOR escrowed in leases ("0" = none)
+  max_price = "0"              # most MOR per GiB-month to pay ("0" = no cap)
 
 [provider]
   enabled = false

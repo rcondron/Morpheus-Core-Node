@@ -9,44 +9,89 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/rcondron/Morpheus-Core-Node/internal/config"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs"
 	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
+	"github.com/rcondron/Morpheus-Core-Node/internal/units"
 )
 
-// failedAudits is how many consecutive failed audits make a copy bad.
-const failedAudits = 2
+const (
+	// failedAudits is how many consecutive failed audits make a copy bad.
+	failedAudits = 2
+	// missingPasses is how many renewal passes in a row must find no
+	// acceptable offer from a provider before its files move elsewhere.
+	missingPasses = 3
+	// orphanTTL is how long a deletion is retried; by then the copy has
+	// lapsed with its leases anyway.
+	orphanTTL = 7 * 24 * time.Hour
+	// syncWindow is how far back the keeper looks for storage sessions the
+	// manifest does not know.
+	syncWindow = 3 * 24 * time.Hour
+)
 
-// Run keeps the store's promises while the node runs: it renews leases
-// before they end, closes leases that no longer hold files, retries
-// deletions, audits copies and repairs or replaces failing ones.
+// Run keeps the store's promises while the node runs. One loop keeps files
+// paid for (renewing, attaching and closing leases, retrying deletions); a
+// second audits copies and repairs failing ones, so a slow provider cannot
+// hold renewals up.
 func (s *Store) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		s.loop(ctx, s.renewPass)
+	}()
+	go func() {
+		defer wg.Done()
+		s.loop(ctx, s.carePass)
+	}()
+	wg.Wait()
+	s.save()
+}
+
+func (s *Store) loop(ctx context.Context, pass func(context.Context)) {
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
 	for {
-		s.Maintain(ctx)
+		pass(ctx)
+		s.save()
 		select {
 		case <-ctx.Done():
-			s.save()
 			return
 		case <-tick.C:
 		}
 	}
 }
 
-// Maintain runs one keeper pass (Run does every minute).
+// Maintain runs one pass of both keeper loops.
 func (s *Store) Maintain(ctx context.Context) {
+	s.renewPass(ctx)
+	s.carePass(ctx)
+	s.save()
+}
+
+func (s *Store) renewPass(ctx context.Context) {
 	s.renew(ctx)
+	s.attachPending(ctx)
 	s.prune(ctx)
 	s.retryDeletes(ctx)
+	if s.due("sync") {
+		s.backoff("sync", time.Hour)
+		if _, err := s.syncSessions(ctx, syncWindow); err != nil {
+			s.log.Debug("could not check the wallet's storage sessions", "err", err)
+		}
+	}
+}
+
+func (s *Store) carePass(ctx context.Context) {
 	s.auditDue(ctx)
 	s.replenish(ctx)
-	s.save()
 }
 
 func (s *Store) due(key string) bool {
@@ -61,25 +106,46 @@ func (s *Store) backoff(key string, d time.Duration) {
 	s.mu.Unlock()
 }
 
+// failed counts a failure behind key and backs off exponentially from base,
+// up to 12 hours.
+func (s *Store) failed(key string, base time.Duration) {
+	s.mu.Lock()
+	n := min(s.fails[key], 5)
+	s.fails[key]++
+	s.retry[key] = time.Now().Add(min(base<<n, 12*time.Hour))
+	s.mu.Unlock()
+}
+
+func (s *Store) succeeded(key string) {
+	s.mu.Lock()
+	delete(s.fails, key)
+	delete(s.retry, key)
+	s.mu.Unlock()
+}
+
 // renew leases more room wherever the leases that outlast the renewal window
 // no longer cover the bytes a provider holds for us.
 func (s *Store) renew(ctx context.Context) {
-	horizon := time.Now().Add(s.opt.RenewBefore)
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
+	now := time.Now()
+	horizon := now.Add(s.opt.RenewBefore)
 	type gap struct {
 		provider common.Address
 		deficit  uint64
-		listing  common.Hash
+		last     *Lease // the provider's lease that lasts longest
 	}
 	var gaps []gap
 	s.mu.Lock()
 	for p, used := range s.usedLocked() {
-		if used == 0 || time.Now().Before(s.retry["p:"+p.Hex()]) {
+		if used == 0 || now.Before(s.retry["p:"+p.Hex()]) {
 			continue
 		}
 		if quota, _ := s.quotaLocked(p, horizon); quota < used {
 			g := gap{provider: p, deficit: used - quota}
 			if l := s.lastLeaseLocked(p); l != nil {
-				g.listing = l.Listing
+				c := *l
+				g.last = &c
 			}
 			gaps = append(gaps, g)
 		}
@@ -89,29 +155,89 @@ func (s *Store) renew(ctx context.Context) {
 		return
 	}
 	offers, err := s.Offers(ctx)
-	if err != nil {
+	partial := errors.Is(err, ErrPartialOffers)
+	if err != nil && !partial {
 		s.log.Warn("cannot renew storage leases: marketplace unavailable", "err", err)
 		return
 	}
 	for _, g := range gaps {
 		key := "p:" + g.provider.Hex()
-		o, ok := offerFrom(offers, g.provider, g.listing)
+		var listing common.Hash
+		if g.last != nil {
+			listing = g.last.Listing
+		}
+		o, ok := offerFrom(offers, g.provider, listing)
 		if !ok {
-			s.log.Warn("storage provider no longer sells storage; moving its files", "provider", g.provider.Hex())
-			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s stopped selling storage; moving its files", short(g.provider.Hex())))
-			s.evacuate(g.provider, "the provider stopped selling storage")
+			if partial {
+				continue // an incomplete read proves nothing; try again next pass
+			}
+			s.mu.Lock()
+			s.missing[g.provider]++
+			n := s.missing[g.provider]
+			s.mu.Unlock()
+			if n < missingPasses {
+				continue
+			}
+			s.log.Warn("storage provider no longer offers storage at an acceptable price; moving its files", "provider", g.provider.Hex())
+			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s no longer offers storage (or only above storage.max_price); moving its files", short(g.provider.Hex())))
+			s.evacuate(g.provider, "the provider no longer offers storage at an acceptable price")
 			s.backoff(key, 15*time.Minute)
 			continue
 		}
+		s.mu.Lock()
+		delete(s.missing, g.provider)
+		s.mu.Unlock()
+		// A provider that raised its price sharply keeps the files only if
+		// no one is cheaper. While its current lease runs, move them; once
+		// it ended, renew anyway rather than risk losing them.
+		if g.last != nil && jumped(o, g.last) {
+			was, is := units.MOR(Offer{Price: g.last.Price, Quota: g.last.Quota}.PerGiBMonth()), units.MOR(o.PerGiBMonth())
+			if _, cheaper := cheaperElsewhere(offers, g.provider, o); cheaper && g.last.EndsAt.After(now) {
+				s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s raised its price from %s to %s per GiB-month; moving its files to a cheaper provider", short(g.provider.Hex()), was, is))
+				s.evacuate(g.provider, "the provider raised its price")
+				s.backoff(key, 15*time.Minute)
+				continue
+			}
+			s.bus.Emit(events.Warn, "storage", fmt.Sprintf("%s raised its price from %s to %s per GiB-month; renewing (no cheaper provider)", short(g.provider.Hex()), was, is))
+		}
 		for n := (g.deficit + o.Quota - 1) / o.Quota; n > 0; n-- {
-			if _, err := s.lease(ctx, o); err != nil {
+			l, err := s.lease(ctx, o)
+			if err != nil {
 				s.log.Warn("could not renew a storage lease", "provider", g.provider.Hex(), "err", err)
 				s.bus.Emit(events.Warn, "storage", fmt.Sprintf("renewing storage with %s failed: %v", short(g.provider.Hex()), err))
 				s.backoff(key, 5*time.Minute)
 				break
 			}
+			if !l.EndsAt.After(horizon) {
+				// The marketplace granted less time than the renewal window:
+				// buying more now would only buy more short leases.
+				s.log.Warn("storage lease ends inside the renewal window; lower storage.renew_before", "provider", g.provider.Hex(), "ends", l.EndsAt)
+				s.bus.Emit(events.Warn, "storage", "a storage lease was shorter than storage.renew_before; lower it")
+				s.backoff(key, max(time.Until(l.EndsAt)/2, time.Minute))
+				break
+			}
 		}
 	}
+}
+
+// jumped reports an offer more than 25% dearer per byte than a lease.
+func jumped(o Offer, last *Lease) bool {
+	if last.Price == nil || last.Quota == 0 {
+		return false
+	}
+	limit := Offer{Price: last.Price, Quota: last.Quota}.PerByte()
+	limit.Mul(limit, big.NewInt(5)).Div(limit, big.NewInt(4))
+	return o.PerByte().Cmp(limit) > 0
+}
+
+// cheaperElsewhere finds an offer from another provider cheaper than o.
+func cheaperElsewhere(offers []Offer, p common.Address, o Offer) (Offer, bool) {
+	for _, x := range offers {
+		if x.Provider != p && cheaper(x, o) {
+			return x, true
+		}
+	}
+	return Offer{}, false
 }
 
 func (s *Store) lastLeaseLocked(p common.Address) *Lease {
@@ -146,6 +272,26 @@ func offerFrom(offers []Offer, p common.Address, listing common.Hash) (Offer, bo
 	return *best, true
 }
 
+// attachPending retries registering leases the provider has not
+// acknowledged, so a paid lease always extends the provider's cover.
+func (s *Store) attachPending(ctx context.Context) {
+	now := time.Now()
+	s.mu.Lock()
+	var list []*Lease
+	for _, l := range s.leases {
+		if !l.Attached && l.EndsAt.After(now) {
+			c := *l
+			list = append(list, &c)
+		}
+	}
+	s.mu.Unlock()
+	for _, l := range list {
+		if err := s.attach(ctx, l); err != nil {
+			s.log.Debug("lease not registered with the provider yet", "session", l.Session.Hex(), "err", err)
+		}
+	}
+}
+
 // prune closes leases that ended, which settles the provider's pay and
 // returns the rest of the stake, and closes live leases at providers that
 // no longer hold our files, which returns their stake early.
@@ -162,21 +308,30 @@ func (s *Store) prune(ctx context.Context) {
 		if now.Before(s.retry["l:"+id.Hex()]) {
 			continue
 		}
+		c := *l
 		switch {
 		case !l.EndsAt.After(now):
-			list = append(list, closing{l, "lease ended"})
+			list = append(list, closing{&c, "lease ended"})
 		case used[l.Provider] == 0 && now.Sub(l.OpenedAt) > 10*time.Minute:
-			list = append(list, closing{l, "no files stored"})
+			list = append(list, closing{&c, "no files stored"})
 		}
 	}
 	s.mu.Unlock()
 	for _, c := range list {
 		l := c.l
+		if len(l.ProviderKey) == 0 {
+			// Adopted leases lack the provider's key; with it the close
+			// carries the provider's own usage report.
+			if pi, err := s.info(ctx, l.peer()); err == nil {
+				l.ProviderKey = pi.key
+			}
+		}
 		if err := s.leaser.CloseLease(ctx, l.session(), c.reason); err != nil {
 			s.log.Warn("could not close a storage lease", "session", l.Session.Hex(), "reason", c.reason, "err", err)
-			s.backoff("l:"+l.Session.Hex(), 15*time.Minute)
+			s.failed("l:"+l.Session.Hex(), 15*time.Minute)
 			continue
 		}
+		s.succeeded("l:" + l.Session.Hex())
 		s.mu.Lock()
 		delete(s.leases, l.Session)
 		s.dirty = true
@@ -184,8 +339,8 @@ func (s *Store) prune(ctx context.Context) {
 	}
 }
 
-// retryDeletes asks providers again to drop deleted files' copies. Copies at
-// providers we no longer lease from are left to lapse.
+// retryDeletes asks providers again to drop deleted files' copies (they
+// honour deletes without a lease), until the copies would have lapsed.
 func (s *Store) retryDeletes(ctx context.Context) {
 	if !s.due("deletes") {
 		return
@@ -199,10 +354,7 @@ func (s *Store) retryDeletes(ctx context.Context) {
 	}
 	var keep []Orphan
 	for _, o := range list {
-		s.mu.Lock()
-		_, leased := s.quotaLocked(o.Provider, time.Now())
-		s.mu.Unlock()
-		if leased == nil {
+		if !o.Since.IsZero() && time.Since(o.Since) > orphanTTL {
 			continue
 		}
 		if err := s.deleteCopy(ctx, peer{o.Provider, o.Endpoint}, o.CID); err != nil {
@@ -213,6 +365,15 @@ func (s *Store) retryDeletes(ctx context.Context) {
 	s.orphans = append(keep, s.orphans[len(list):]...)
 	s.dirty = true
 	s.mu.Unlock()
+}
+
+func (s *Store) orphanedLocked(cid string, p common.Address) bool {
+	for _, o := range s.orphans {
+		if o.CID == cid && o.Provider == p {
+			return true
+		}
+	}
+	return false
 }
 
 // AuditResult is the outcome of one proof-of-storage challenge.
@@ -276,7 +437,9 @@ func (s *Store) auditDue(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	for _, j := range jobs {
-		s.challenge(ctx, j.f, j.c)
+		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		s.challenge(cctx, j.f, j.c)
+		cancel()
 	}
 }
 
@@ -366,21 +529,31 @@ func (s *Store) evacuate(p common.Address, reason string) {
 }
 
 // replenish replaces bad copies and adds copies to files stored with fewer
-// than Replicas, a few files per pass.
+// than Replicas, a few files per pass, backing off per file.
 func (s *Store) replenish(ctx context.Context) {
-	var work []string
+	type job struct {
+		id   string
+		size uint64
+	}
+	var work []job
 	s.mu.Lock()
 	for _, f := range s.sortedFilesLocked() {
 		healthy, bad := split(f)
 		if (len(bad) > 0 || len(healthy) < s.opt.Replicas) && !time.Now().Before(s.retry["f:"+f.ID]) && len(work) < 4 {
-			work = append(work, f.ID)
+			work = append(work, job{f.ID, f.StoredBytes})
 		}
 	}
 	s.mu.Unlock()
-	for _, id := range work {
-		if err := s.repair(ctx, id); err != nil {
-			s.log.Warn("could not repair a stored file", "file", id, "err", err)
-			s.backoff("f:"+id, 30*time.Minute)
+	for _, j := range work {
+		// A transfer that crawls must not hold the loop forever.
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Minute+time.Duration(j.size/(256<<10))*time.Second)
+		err := s.repair(rctx, j.id)
+		cancel()
+		if err != nil {
+			s.log.Warn("could not repair a stored file", "file", j.id, "err", err)
+			s.failed("f:"+j.id, 30*time.Minute)
+		} else {
+			s.succeeded("f:" + j.id)
 		}
 	}
 }
@@ -396,8 +569,9 @@ func split(f *File) (healthy, bad []*Copy) {
 	return healthy, bad
 }
 
-// repair rebuilds a file's copies from one that is intact: new copies go to
-// providers that do not hold it, then bad copies are dropped.
+// repair rebuilds a file's copies: with enough healthy copies it only drops
+// the bad ones; otherwise it finds a new provider first, then copies the
+// file there from an intact copy and drops the bad ones.
 func (s *Store) repair(ctx context.Context, id string) error {
 	f, err := s.File(id)
 	if err != nil {
@@ -405,8 +579,16 @@ func (s *Store) repair(ctx context.Context, id string) error {
 	}
 	healthy, bad := split(f)
 	need := s.opt.Replicas - len(healthy)
-	if need <= 0 && len(bad) == 0 {
+	if need <= 0 {
+		s.dropBad(ctx, f, 0)
 		return nil
+	}
+	exclude := map[common.Address]bool{}
+	for _, c := range f.Copies {
+		exclude[c.Provider] = true
+	}
+	if err := s.canPlace(ctx, f.StoredBytes, exclude); err != nil {
+		return err
 	}
 	skip := map[common.Address]bool{}
 	for _, c := range bad {
@@ -420,77 +602,101 @@ func (s *Store) repair(ctx context.Context, id string) error {
 		return err
 	}
 	defer drop(data)
-	exclude := map[common.Address]bool{}
-	for _, c := range f.Copies {
-		exclude[c.Provider] = true
-	}
-	var added []*Copy
-	if need > 0 {
-		var releases []func()
-		var errs []string
-		added, releases, errs = s.addCopies(ctx, f, data, need, exclude)
-		defer func() {
-			for _, release := range releases {
-				release()
-			}
-		}()
-		if len(added) == 0 {
-			return fmt.Errorf("no provider took a new copy: %s", strings.Join(errs, "; "))
+	added, releases, errs := s.addCopies(ctx, f, data, need, exclude)
+	defer func() {
+		for _, release := range releases {
+			release()
 		}
+	}()
+	if len(added) == 0 {
+		return fmt.Errorf("no provider took a new copy: %s", strings.Join(errs, "; "))
 	}
 	s.mu.Lock()
-	live := s.files[id]
+	if live := s.files[id]; live != nil {
+		live.Copies = append(live.Copies, added...)
+		s.dirty = true
+	}
+	s.mu.Unlock()
+	dropped := s.dropBad(ctx, f, len(added))
+	s.save()
+	s.log.Info("stored file repaired", "file", id, "added", len(added), "dropped", dropped)
+	s.bus.Emit(events.Info, "storage", fmt.Sprintf("repaired %s: %d new copy(ies), %d bad dropped", displayName(f), len(added), dropped))
+	return nil
+}
+
+// dropBad removes a file's bad copies, never its last copy, and asks their
+// providers to delete them.
+func (s *Store) dropBad(ctx context.Context, f *File, added int) int {
+	s.mu.Lock()
+	live := s.files[f.ID]
 	if live == nil {
 		s.mu.Unlock()
-		return nil
+		return 0
 	}
-	live.Copies = append(live.Copies, added...)
-	var dropped []*Copy
-	if len(healthy)+len(added) > 0 { // never drop the last copy
-		kept := live.Copies[:0]
-		for _, c := range live.Copies {
-			if c.Failures >= failedAudits {
-				dropped = append(dropped, c)
-			} else {
-				kept = append(kept, c)
-			}
-		}
-		live.Copies = kept
+	healthy, bad := split(live)
+	if len(healthy) == 0 || len(bad) == 0 {
+		s.mu.Unlock()
+		return 0
 	}
+	live.Copies = healthy
 	s.dirty = true
 	s.mu.Unlock()
-	s.save()
-	for _, c := range dropped {
+	for _, c := range bad {
 		if err := s.deleteCopy(ctx, c.peer(), f.CID); err != nil {
 			s.mu.Lock()
-			s.orphans = append(s.orphans, Orphan{CID: f.CID, Provider: c.Provider, Endpoint: c.Endpoint})
+			s.orphans = append(s.orphans, Orphan{CID: f.CID, Provider: c.Provider, Endpoint: c.Endpoint, Since: time.Now()})
 			s.dirty = true
 			s.mu.Unlock()
 		}
 	}
-	s.log.Info("stored file repaired", "file", id, "added", len(added), "dropped", len(dropped))
-	s.bus.Emit(events.Info, "storage", fmt.Sprintf("repaired %s: %d new copy(ies), %d bad dropped", displayName(f), len(added), len(dropped)))
-	return nil
+	return len(bad)
 }
 
-// Recover rebuilds the manifest after it was lost (on a new machine, say):
-// it finds the wallet's storage leases among its recent sessions, lists what
-// each provider holds and adds the files missing locally, reading names back
-// from encrypted headers. It returns how many files it added.
-func (s *Store) Recover(ctx context.Context) (int, error) {
+// canPlace reports whether a provider outside exclude could take size more
+// bytes, before anything is downloaded for it.
+func (s *Store) canPlace(ctx context.Context, size uint64, exclude map[common.Address]bool) error {
+	horizon := time.Now().Add(s.opt.RenewBefore)
+	s.mu.Lock()
+	used := s.usedLocked()
+	for _, l := range s.leases {
+		if !exclude[l.Provider] && s.allowed(l.Provider) {
+			if quota, _ := s.quotaLocked(l.Provider, horizon); quota >= used[l.Provider]+size {
+				s.mu.Unlock()
+				return nil
+			}
+		}
+	}
+	s.mu.Unlock()
+	offers, err := s.Offers(ctx)
+	if err != nil && !errors.Is(err, ErrPartialOffers) {
+		return fmt.Errorf("read storage offers: %w", err)
+	}
+	for _, o := range offers {
+		if !exclude[o.Provider] && o.Quota >= size {
+			return nil
+		}
+	}
+	return fmt.Errorf("no other provider offers room for %s", config.FormatBytes(size))
+}
+
+// syncSessions looks among the wallet's recent sessions for storage leases
+// the manifest does not know (a crash between opening and recording one, or
+// a lost manifest): live ones are adopted, and ended ones still open are
+// closed so their stake returns. It returns the providers of all storage
+// sessions in the window.
+func (s *Store) syncSessions(ctx context.Context, window time.Duration) (map[common.Address]string, error) {
 	ids, err := s.k.RecentUserSessionIDs(ctx, s.w.Address(), 500)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	sessions, err := s.k.GetSessions(ctx, ids)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	now := time.Now()
 	providers := map[common.Address]string{}
 	for _, cs := range sessions {
-		// Providers keep files for a grace period after the last lease.
-		if cs.EndsAt == nil || cs.EndsAtTime().Before(now.Add(-7*24*time.Hour)) {
+		if cs.EndsAt == nil || cs.EndsAtTime().Before(now.Add(-window)) {
 			continue
 		}
 		bid, err := s.k.GetBid(ctx, common.Hash(cs.BidId))
@@ -510,19 +716,46 @@ func (s *Store) Recover(ctx context.Context) (int, error) {
 			ep = morrpc.NormalizeEndpoint(pr.Endpoint)
 			providers[bid.Provider] = ep
 		}
-		if cs.Closed() || !now.Before(cs.EndsAtTime()) {
+		s.mu.Lock()
+		known := s.leases[cs.ID] != nil
+		s.mu.Unlock()
+		if known || cs.Closed() {
 			continue
 		}
-		s.mu.Lock()
-		if s.leases[cs.ID] == nil {
-			s.leases[cs.ID] = &Lease{
-				Session: cs.ID, Listing: common.Hash(bid.ModelId), ListingName: model.Name, Bid: common.Hash(cs.BidId),
-				Provider: bid.Provider, Endpoint: ep, Quota: marketplace.StorageQuota(model.Tags), Price: bid.PricePerSecond,
-				Stake: cs.Stake, OpenedAt: cs.OpenedAtTime(), EndsAt: cs.EndsAtTime(),
-			}
-			s.dirty = true
+		l := &Lease{
+			Session: cs.ID, Listing: common.Hash(bid.ModelId), ListingName: model.Name, Bid: common.Hash(cs.BidId),
+			Provider: bid.Provider, Endpoint: ep, Quota: marketplace.StorageQuota(model.Tags), Price: bid.PricePerSecond,
+			Stake: cs.Stake, OpenedAt: cs.OpenedAtTime(), EndsAt: cs.EndsAtTime(),
 		}
-		s.mu.Unlock()
+		if pi, err := s.info(ctx, l.peer()); err == nil {
+			l.ProviderKey = pi.key
+		}
+		if now.Before(l.EndsAt) {
+			s.mu.Lock()
+			if s.leases[l.Session] == nil {
+				s.leases[l.Session] = l
+				s.dirty = true
+			}
+			s.mu.Unlock()
+			s.log.Info("adopted a storage lease", "session", l.Session.Hex(), "provider", l.Provider.Hex())
+			continue
+		}
+		if err := s.leaser.CloseLease(ctx, l.session(), "storage lease ended"); err != nil {
+			s.log.Warn("could not close an ended storage session", "session", l.Session.Hex(), "err", err)
+		}
+	}
+	s.save()
+	return providers, nil
+}
+
+// Recover rebuilds the manifest after it was lost (on a new machine, say):
+// it finds the wallet's storage leases among its recent sessions, lists what
+// each provider holds and adds the files missing locally, reading names back
+// from encrypted headers. It returns how many files it added.
+func (s *Store) Recover(ctx context.Context) (int, error) {
+	providers, err := s.syncSessions(ctx, 7*24*time.Hour)
+	if err != nil {
+		return 0, err
 	}
 	added := 0
 	var errs []string
@@ -546,10 +779,15 @@ func (s *Store) Recover(ctx context.Context) (int, error) {
 }
 
 // addRecovered records a file a provider lists, as a new file or as another
-// copy of a known one. It reports whether the file was new.
+// copy of a known one; copies we deleted stay deleted. It reports whether
+// the file was new.
 func (s *Store) addRecovered(ctx context.Context, p peer, lf morrpc.StorageFile) bool {
 	cp := &Copy{Provider: p.provider, Endpoint: p.endpoint, StoredAt: lf.StoredAt}
 	s.mu.Lock()
+	if s.orphanedLocked(lf.CID, p.provider) {
+		s.mu.Unlock()
+		return false
+	}
 	for _, f := range s.files {
 		if f.CID != lf.CID {
 			continue
