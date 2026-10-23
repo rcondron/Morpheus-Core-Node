@@ -34,6 +34,18 @@ func TestZZMorcoreInterop(t *testing.T) {
 		PlainError      msgs.RpcResponse `json:"plainError"`
 		UserPub         string           `json:"userPub"`
 		ProviderPub     string           `json:"providerPub"`
+
+		StreamStartRequest      msgs.RPCMessage  `json:"streamStartRequest"`
+		StreamChunkRequest      msgs.RPCMessage  `json:"streamChunkRequest"`
+		StreamEndRequest        msgs.RPCMessage  `json:"streamEndRequest"`
+		StreamStartResponse     msgs.RpcResponse `json:"streamStartResponse"`
+		StreamChunkResponse     msgs.RpcResponse `json:"streamChunkResponse"`
+		AgentToolsRequest       msgs.RPCMessage  `json:"agentToolsRequest"`
+		AgentCallRequest        msgs.RPCMessage  `json:"agentCallRequest"`
+		AgentResponse           msgs.RpcResponse `json:"agentResponse"`
+		SpeechResponse          msgs.RpcResponse `json:"speechResponse"`
+		ImageResponse           msgs.RpcResponse `json:"imageResponse"`
+		TranscriptDeltaResponse msgs.RpcResponse `json:"transcriptDeltaResponse"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		t.Fatal(err)
@@ -145,5 +157,103 @@ func TestZZMorcoreInterop(t *testing.T) {
 
 	if s := v.PlainError.Error.Data.Signature.String(); s != "0x00" {
 		t.Fatalf("plain error signature %s, reference expects 0x00", s)
+	}
+
+	// Upload streams: the reference provider verifies our requests...
+	var ss msgs.SessionPromptStreamStartReq
+	_ = json.Unmarshal(v.StreamStartRequest.Params, &ss)
+	sig = ss.Signature
+	ss.Signature = lib.HexString{}
+	if !m.VerifySignature(ss, sig, userPub, log) {
+		t.Fatal("reference rejected our stream start signature")
+	}
+	var sc msgs.SessionPromptStreamChunkReq
+	_ = json.Unmarshal(v.StreamChunkRequest.Params, &sc)
+	sig = sc.Signature
+	sc.Signature = lib.HexString{}
+	if !m.VerifySignature(sc, sig, userPub, log) {
+		t.Fatal("reference rejected our stream chunk signature")
+	}
+	var se msgs.SessionPromptStreamEndReq
+	_ = json.Unmarshal(v.StreamEndRequest.Params, &se)
+	sig = se.Signature
+	se.Signature = lib.HexString{}
+	if !m.VerifySignature(se, sig, userPub, log) {
+		t.Fatal("reference rejected our stream end signature")
+	}
+	audio, err := processAudioTranscription([]byte(se.AudioRequestParam), log)
+	if err != nil || audio == nil || audio.Language != "en" || string(audio.Format) != "verbose_json" || len(audio.TimestampGranularities) != 1 {
+		t.Fatalf("reference cannot parse our transcription request: %v %+v", err, audio)
+	}
+	// ...and its consumer verifies our acknowledgements.
+	var ssr msgs.SessionPromptStreamStartRes
+	_ = json.Unmarshal(*v.StreamStartResponse.Result, &ssr)
+	sig = ssr.Signature
+	ssr.Signature = lib.HexString{}
+	if !m.VerifySignature(ssr, sig, provPub, log) || ssr.StreamID != "feedbeef" {
+		t.Fatal("reference rejected our stream start response")
+	}
+	var scr msgs.SessionPromptStreamChunkRes
+	_ = json.Unmarshal(*v.StreamChunkResponse.Result, &scr)
+	sig = scr.Signature
+	scr.Signature = lib.HexString{}
+	if !m.VerifySignature(scr, sig, provPub, log) || scr.ChunkIndex != 1 {
+		t.Fatal("reference rejected our stream chunk response")
+	}
+
+	// Agents.
+	var at msgs.GetAgentToolsReq
+	_ = json.Unmarshal(v.AgentToolsRequest.Params, &at)
+	sig = at.Signature
+	at.Signature = lib.HexString{}
+	if !m.VerifySignature(at, sig, userPub, log) {
+		t.Fatal("reference rejected our agent.get_tools signature")
+	}
+	var ac msgs.CallAgentToolReq
+	_ = json.Unmarshal(v.AgentCallRequest.Params, &ac)
+	sig = ac.Signature
+	ac.Signature = lib.HexString{}
+	if !m.VerifySignature(ac, sig, userPub, log) || ac.ToolName != "add" {
+		t.Fatal("reference rejected our agent.call_tool signature")
+	}
+	var ar msgs.CallAgentToolRes
+	_ = json.Unmarshal(*v.AgentResponse.Result, &ar)
+	sig = ar.Signature
+	ar.Signature = lib.HexString{}
+	if !m.VerifySignature(ar, sig, provPub, log) {
+		t.Fatal("reference rejected our agent response signature")
+	}
+	if out, err := lib.DecryptString(ar.Message, userKey.Hex()); err != nil || !strings.Contains(out, `"text":"42"`) {
+		t.Fatalf("reference cannot decrypt our agent response: %v", err)
+	}
+
+	// Media payloads, decoded the way the reference consumer does.
+	decrypt := func(res msgs.RpcResponse) []byte {
+		var inf InferenceRes
+		_ = json.Unmarshal(*res.Result, &inf)
+		sig := inf.Signature
+		inf.Signature = []byte{}
+		if !m.VerifySignature(inf, sig, provPub, log) {
+			t.Fatal("reference rejected a media chunk signature")
+		}
+		var ct lib.HexString
+		_ = json.Unmarshal(inf.Message, &ct)
+		plain, err := lib.DecryptBytes(ct, userKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+	var speech []byte
+	if err := json.Unmarshal(decrypt(v.SpeechResponse), &speech); err != nil || string(speech) != "AUDIO ✓" {
+		t.Fatalf("reference cannot decode our speech chunk: %v", err)
+	}
+	var img gcs.ImageRawContentResult
+	if err := json.Unmarshal(decrypt(v.ImageResponse), &img); err != nil || img.ImageRawContent == "" {
+		t.Fatalf("reference cannot decode our image result: %v", err)
+	}
+	var delta gcs.AudioTranscriptionDelta
+	if err := json.Unmarshal(decrypt(v.TranscriptDeltaResponse), &delta); err != nil || delta.Type != "transcript.text.delta" || delta.Delta != "hel" {
+		t.Fatalf("reference cannot decode our transcript delta: %v", err)
 	}
 }

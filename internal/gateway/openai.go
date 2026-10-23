@@ -49,7 +49,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 	p := principalFrom(r)
 	data := []openAIModel{}
 	for _, m := range models {
-		if m.Bids > 0 && s.allowed(p, m) {
+		if m.Bids > 0 && !m.IsStorage() && s.allowed(p, m) {
 			data = append(data, toOpenAIModel(m))
 		}
 	}
@@ -58,7 +58,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 	m, err := s.d.Market.Resolve(r.Context(), r.PathValue("id"))
-	if err != nil || !s.allowed(principalFrom(r), *m) {
+	if err != nil || m.IsStorage() || !s.allowed(principalFrom(r), *m) {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", fmt.Sprintf("model %q not found", r.PathValue("id")))
 		return
 	}
@@ -68,27 +68,10 @@ func (s *Server) getModel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) { s.infer(w, r, "chat") }
 func (s *Server) embeddings(w http.ResponseWriter, r *http.Request)      { s.infer(w, r, "embeddings") }
 
-// infer routes one OpenAI-shaped request to a marketplace provider.
+// infer routes one OpenAI-shaped JSON request to a marketplace provider.
 func (s *Server) infer(w http.ResponseWriter, r *http.Request, kind string) {
-	ctx := r.Context()
-	p := principalFrom(r)
-	if s.d.Sessions == nil {
-		writeError(w, http.StatusServiceUnavailable, "api_error", "consumer_disabled", "this node runs in provider-only mode")
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
-	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "body_too_large", "request body too large or unreadable")
-		return
-	}
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "request body must be a JSON object")
-		return
-	}
-	var modelName string
-	if err := json.Unmarshal(req["model"], &modelName); err != nil || strings.TrimSpace(modelName) == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "model_required", "\"model\" is required (see GET /v1/models)")
+	req, ok := s.readJSON(w, r)
+	if !ok {
 		return
 	}
 	stream := false
@@ -109,41 +92,87 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, kind string) {
 		}
 		req["type"] = json.RawMessage(`"embeddings"`)
 	}
-
-	pinned := r.Header.Get("session_id")
-	if pinned == "" {
-		pinned = r.Header.Get("X-Morpheus-Session")
-	}
-
-	model, err := s.d.Market.Resolve(ctx, modelName)
-	if err != nil {
-		if errors.Is(err, marketplace.ErrModelNotFound) {
-			writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", fmt.Sprintf("model %q is not offered on the Morpheus marketplace (see GET /v1/models)", modelName))
-		} else {
-			writeError(w, http.StatusBadGateway, "api_error", "marketplace_unavailable", err.Error())
-		}
-		return
-	}
-	if !s.allowed(p, *model) {
-		writeError(w, http.StatusForbidden, "permission_error", "model_not_allowed", fmt.Sprintf("this API key may not use %q", model.Alias))
-		return
-	}
-	if !p.admin {
-		release, err := s.d.Keys.Admit(p.key.ID)
-		if err != nil {
-			writeLimitError(w, err)
-			return
-		}
-		defer release()
-	}
-
 	forward, err := json.Marshal(req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
 		return
 	}
+	s.route(w, r, &call{
+		kind: kind, modelName: modelOf(req), stream: stream, body: forward,
+		output: func(sess *consumer.Session) output { return newResponder(w, stream, sess) },
+	})
+}
 
-	rec := events.Request{Time: time.Now(), Key: p.name(), Model: model.Alias, Kind: kind, Stream: stream}
+// readJSON reads a JSON object request body.
+func (s *Server) readJSON(w http.ResponseWriter, r *http.Request) (map[string]json.RawMessage, bool) {
+	if s.d.Sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "api_error", "consumer_disabled", "this node runs in provider-only mode")
+		return nil, false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "body_too_large", "request body too large or unreadable")
+		return nil, false
+	}
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil || req == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "request body must be a JSON object")
+		return nil, false
+	}
+	return req, true
+}
+
+func modelOf(req map[string]json.RawMessage) string {
+	var name string
+	_ = json.Unmarshal(req["model"], &name)
+	return strings.TrimSpace(name)
+}
+
+// output renders provider payloads as the client's HTTP response.
+type output interface {
+	chunk(payload []byte) error
+	// finish completes the response (or reports err) and returns the status sent.
+	finish(err error) int
+}
+
+// call is one request to route over a marketplace session.
+type call struct {
+	kind      string // for stats: chat, embeddings, transcription, speech, image, decisions, agent
+	modelName string
+	stream    bool
+	body      []byte // forwarded with Send unless do is set
+	// do performs the exchange on a leased session (default: Send body).
+	do     func(ctx context.Context, l *consumer.Lease, onChunk func([]byte) error) (*consumer.Result, error)
+	output func(sess *consumer.Session) output
+}
+
+// route resolves the model, applies the key's permissions and limits, leases
+// a session (opening one if needed) and fails over to another provider when
+// one fails before producing output.
+func (s *Server) route(w http.ResponseWriter, r *http.Request, c *call) {
+	ctx := r.Context()
+	p := principalFrom(r)
+	if c.modelName == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "model_required", "\"model\" is required (see GET /v1/models)")
+		return
+	}
+	pinned := r.Header.Get("session_id")
+	if pinned == "" {
+		pinned = r.Header.Get("X-Morpheus-Session")
+	}
+	model, release, ok := s.admit(w, r, p, c.modelName)
+	if !ok {
+		return
+	}
+	defer release()
+	if c.do == nil {
+		body := c.body
+		c.do = func(ctx context.Context, l *consumer.Lease, onChunk func([]byte) error) (*consumer.Result, error) {
+			return s.d.Sessions.Send(ctx, l, body, onChunk)
+		}
+	}
+
+	rec := events.Request{Time: time.Now(), Key: p.name(), Model: model.Alias, Kind: c.kind, Stream: c.stream}
 	exclude := map[common.Address]bool{}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -161,8 +190,8 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, kind string) {
 		}
 		sess := lease.Session
 		rec.Session, rec.Provider = sess.ID.Hex(), sess.Provider.Hex()
-		out := newResponder(w, stream, sess)
-		res, err := s.d.Sessions.Send(ctx, lease, forward, out.chunk)
+		out := c.output(sess)
+		res, err := c.do(ctx, lease, out.chunk)
 		var ee *morrpc.EngineError
 		sessionOK := err == nil || errors.As(err, &ee) || ctx.Err() != nil
 		lease.Release(sessionOK, tokens(res, true), tokens(res, false), ttft(res))
@@ -180,6 +209,41 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, kind string) {
 	}
 	writeError(w, http.StatusBadGateway, "api_error", "provider_error", "providers failed: "+errString(lastErr))
 	s.finish(p, rec, http.StatusBadGateway, nil, lastErr)
+}
+
+// admit resolves a model the key may use and takes a slot under the key's
+// limits; release frees the slot.
+func (s *Server) admit(w http.ResponseWriter, r *http.Request, p principal, name string) (*marketplace.Model, func(), bool) {
+	if s.d.Sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "api_error", "consumer_disabled", "this node runs in provider-only mode")
+		return nil, nil, false
+	}
+	model, err := s.d.Market.Resolve(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, marketplace.ErrModelNotFound) {
+			writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", fmt.Sprintf("model %q is not offered on the Morpheus marketplace (see GET /v1/models)", name))
+		} else {
+			writeError(w, http.StatusBadGateway, "api_error", "marketplace_unavailable", err.Error())
+		}
+		return nil, nil, false
+	}
+	if model.IsStorage() {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "storage_listing", fmt.Sprintf("%q is a storage listing; store files with /v1/files", model.Alias))
+		return nil, nil, false
+	}
+	if !s.allowed(p, *model) {
+		writeError(w, http.StatusForbidden, "permission_error", "model_not_allowed", fmt.Sprintf("this API key may not use %q", model.Alias))
+		return nil, nil, false
+	}
+	if p.admin {
+		return model, func() {}, true
+	}
+	release, err := s.d.Keys.Admit(p.key.ID)
+	if err != nil {
+		writeLimitError(w, err)
+		return nil, nil, false
+	}
+	return model, release, true
 }
 
 func errString(err error) string {
@@ -301,22 +365,8 @@ func (o *responder) chunk(payload []byte) error {
 
 // finish completes the response and returns the HTTP status sent.
 func (o *responder) finish(err error) int {
-	var ee *morrpc.EngineError
 	if err != nil && !o.started {
-		o.headers()
-		if errors.As(err, &ee) {
-			o.w.Header().Set("Content-Type", "application/json")
-			o.w.WriteHeader(ee.HTTPStatus())
-			_, _ = o.w.Write(engineErrorBody(ee))
-			return ee.HTTPStatus()
-		}
-		var pe *consumer.ProviderError
-		if errors.As(err, &pe) {
-			writeError(o.w, http.StatusBadGateway, "api_error", "provider_error", err.Error())
-			return http.StatusBadGateway
-		}
-		writeError(o.w, http.StatusBadGateway, "api_error", "upstream_error", err.Error())
-		return http.StatusBadGateway
+		return failure(o.w, o.sess, err)
 	}
 	if o.stream {
 		if err != nil {

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Headless node image (~18 MB). Build, configure once, then run:
+# Headless node image (~19 MB). Build, configure once, then run:
 #   docker build -t morcore .
 #   docker run --rm -it -v morcore:/data -e MORCORE_PASSWORD=... morcore init --yes \
 #       --network mainnet --listen 0.0.0.0:8082 --api-key my-agent --password-env MORCORE_PASSWORD

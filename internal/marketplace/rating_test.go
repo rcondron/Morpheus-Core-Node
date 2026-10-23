@@ -94,3 +94,15 @@ func TestStakeScoreWithRealisticAmounts(t *testing.T) {
 		t.Fatalf("stake far above 10x the minimum scored %v, want 1", got)
 	}
 }
+
+func TestStorageQuota(t *testing.T) {
+	if q := StorageQuota([]string{"storage", "ipfs", "quota:10GiB"}); q != 10<<30 {
+		t.Fatalf("quota %d", q)
+	}
+	if q := StorageQuota([]string{"llm", "quota:10GiB"}); q != 0 {
+		t.Fatal("a non-storage model has a quota")
+	}
+	if q := StorageQuota(StorageTags(512 << 20)); q != 512<<20 {
+		t.Fatalf("round trip quota %d (%v)", q, StorageTags(512<<20))
+	}
+}

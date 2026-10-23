@@ -21,6 +21,7 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/consumer"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
+	"github.com/rcondron/Morpheus-Core-Node/internal/storage"
 )
 
 // Deps are the node components the gateway serves.
@@ -33,6 +34,10 @@ type Deps struct {
 	Status     func(ctx context.Context) any
 	CORS       []string
 	Log        *slog.Logger
+	// ReloadProvider re-reads the provider's models and agents (nil: no provider).
+	ReloadProvider func(ctx context.Context) (any, error)
+	// Files is the user's marketplace storage (nil when the consumer role is off).
+	Files *storage.Store
 }
 
 // Server is the HTTP API.
@@ -58,6 +63,17 @@ func (s *Server) routes() {
 	m.Handle("GET /v1/models/{id...}", s.auth(apikeys.ScopeInference, s.getModel))
 	m.Handle("POST /v1/chat/completions", s.auth(apikeys.ScopeInference, s.chatCompletions))
 	m.Handle("POST /v1/embeddings", s.auth(apikeys.ScopeInference, s.embeddings))
+	m.Handle("POST /v1/audio/transcriptions", s.auth(apikeys.ScopeInference, s.transcriptions))
+	m.Handle("POST /v1/audio/speech", s.auth(apikeys.ScopeInference, s.speech))
+	m.Handle("POST /v1/images/generations", s.auth(apikeys.ScopeInference, s.imageGenerations))
+	m.Handle("POST /v1/decisions", s.auth(apikeys.ScopeInference, s.decisions))
+	m.Handle("GET /v1/agents/{model}/tools", s.auth(apikeys.ScopeInference, s.agentTools))
+	m.Handle("POST /v1/agents/{model}/tools/{tool}", s.auth(apikeys.ScopeInference, s.agentCall))
+	m.Handle("POST /v1/files", s.auth(apikeys.ScopeStorage, s.uploadFile))
+	m.Handle("GET /v1/files", s.auth(apikeys.ScopeStorage, s.listFiles))
+	m.Handle("GET /v1/files/{id}", s.auth(apikeys.ScopeStorage, s.getFile))
+	m.Handle("GET /v1/files/{id}/content", s.auth(apikeys.ScopeStorage, s.fileContent))
+	m.Handle("DELETE /v1/files/{id}", s.auth(apikeys.ScopeStorage, s.deleteFile))
 
 	m.Handle("GET /admin/status", s.auth(apikeys.ScopeSessions, s.status))
 	m.Handle("GET /admin/events", s.auth(apikeys.ScopeSessions, s.recentEvents))
@@ -72,6 +88,24 @@ func (s *Server) routes() {
 	m.Handle("PATCH /admin/keys/{ref}", s.auth(apikeys.ScopeAdmin, s.updateKey))
 	m.Handle("DELETE /admin/keys/{ref}", s.auth(apikeys.ScopeAdmin, s.revokeKey))
 	m.Handle("POST /admin/keys/{ref}/rotate", s.auth(apikeys.ScopeAdmin, s.rotateKey))
+	m.Handle("POST /admin/provider/reload", s.auth(apikeys.ScopeAdmin, s.reloadProvider))
+	m.Handle("GET /admin/storage", s.auth(apikeys.ScopeStorage, s.storageStatus))
+	m.Handle("GET /admin/storage/offers", s.auth(apikeys.ScopeStorage, s.storageOffers))
+	m.Handle("POST /admin/storage/audit", s.auth(apikeys.ScopeStorage, s.storageAudit))
+	m.Handle("POST /admin/storage/recover", s.auth(apikeys.ScopeAdmin, s.storageRecover))
+}
+
+func (s *Server) reloadProvider(w http.ResponseWriter, r *http.Request) {
+	if s.d.ReloadProvider == nil {
+		writeError(w, http.StatusNotFound, "invalid_request_error", "provider_disabled", "the provider role is not enabled on this node")
+		return
+	}
+	out, err := s.d.ReloadProvider(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "reload_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // Handler exposes the router (with middleware) for tests and embedding.

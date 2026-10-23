@@ -30,9 +30,12 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/consumer"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/gateway"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/ipfstest"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/kubo"
 	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
 	"github.com/rcondron/Morpheus-Core-Node/internal/provider"
+	"github.com/rcondron/Morpheus-Core-Node/internal/storage"
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
 )
 
@@ -112,6 +115,7 @@ func newBackend(delay time.Duration) *fakeBackend {
 
 type harness struct {
 	t        *testing.T
+	ids      map[string]common.Hash
 	fc       *chaintest.Chain
 	backend  *fakeBackend
 	consumer *wallet.Wallet
@@ -123,11 +127,28 @@ type harness struct {
 	bus      *events.Bus
 	admin    string
 	cancel   context.CancelFunc
+
+	// Storage, when an offering is a storage listing.
+	kubo       *ipfstest.Node
+	storageSrv *storage.Server
+	store      *storage.Store
+	ck         *chain.Contracts
+	market     *marketplace.Market
+	dir        string
 }
 
-func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration) *harness {
+// offering is an extra model, agent or storage listing the test provider
+// sells.
+type offering struct {
+	name  string
+	model *provider.Model // ID is filled in
+	agent *provider.Agent
+	quota uint64 // a storage listing of this many bytes per lease
+}
+
+func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration, extra ...offering) *harness {
 	t.Helper()
-	h := &harness{t: t, admin: "admin-token-123", bus: events.New()}
+	h := &harness{t: t, admin: "admin-token-123", bus: events.New(), ids: map[string]common.Hash{}}
 	log := logger()
 	h.fc = chaintest.New(84532)
 	t.Cleanup(h.fc.Close)
@@ -149,10 +170,43 @@ func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration) *harn
 	pk := chain.NewContracts(pc, chaintest.Diamond, chaintest.MOR, big.NewInt(84532))
 	ptx := chain.NewTxSender(pk, h.provW, false, log)
 	h.modelID = h.fc.AddModel("llama-3.3-70b", "llm")
-	prov := provider.New(provider.Options{
-		Models:  []provider.Model{{ID: h.modelID, Name: "llama-3.3-70b", APIURL: h.backend.srv.URL + "/v1/chat/completions", Backend: "backend-model"}},
-		Version: "test",
-	}, h.provW, pk, ptx, events.New(), log)
+	models := []provider.Model{{ID: h.modelID, Name: "llama-3.3-70b", APIURL: h.backend.srv.URL + "/v1/chat/completions", Backend: "backend-model"}}
+	var agents []provider.Agent
+	var listings []common.Hash
+	for _, o := range extra {
+		if o.quota > 0 {
+			id := h.fc.AddModel(o.name, marketplace.StorageTags(o.quota)...)
+			h.ids[o.name] = id
+			listings = append(listings, id)
+			continue
+		}
+		id := h.fc.AddModel(o.name)
+		h.ids[o.name] = id
+		if o.model != nil {
+			m := *o.model
+			m.ID, m.Name = id, o.name
+			models = append(models, m)
+		} else {
+			a := *o.agent
+			a.ID, a.Name = id, o.name
+			agents = append(agents, a)
+		}
+	}
+	prov := provider.New(provider.Options{Models: models, Agents: agents, Version: "test"}, h.provW, pk, ptx, events.New(), log)
+	h.dir = t.TempDir()
+	if len(listings) > 0 {
+		h.kubo = ipfstest.New()
+		t.Cleanup(h.kubo.Close)
+		kc, err := kubo.New(h.kubo.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.storageSrv = storage.NewServer(storage.ServerOptions{
+			Listings: listings, MaxFileBytes: 64 << 20, Grace: time.Hour, StatePath: filepath.Join(h.dir, "storage_provider.json"), Version: "test",
+		}, h.provW, pk, kc, prov.ServesFor, events.New(), log)
+		prov.SetStorage(h.storageSrv)
+		go h.storageSrv.Run(ctx)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -163,6 +217,9 @@ func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration) *harn
 
 	h.fc.AddProvider(h.provW.Address(), ln.Addr().String())
 	h.fc.AddBid(h.provW.Address(), h.modelID, big.NewInt(1_000_000_000_000_000)) // 0.001 MOR/s
+	for _, id := range h.ids {
+		h.fc.AddBid(h.provW.Address(), id, big.NewInt(1_000_000_000_000_000))
+	}
 
 	// A second, unreachable provider that must be skipped.
 	dead, _ := wallet.Generate()
@@ -174,7 +231,8 @@ func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration) *harn
 	ck := chain.NewContracts(cc, chaintest.Diamond, chaintest.MOR, big.NewInt(84532))
 	ctx2 := chain.NewTxSender(ck, h.consumer, false, log)
 	market := marketplace.New(ck, nil, nil, log)
-	dir := t.TempDir()
+	h.ck, h.market = ck, market
+	dir := h.dir
 	h.mgr = consumer.New(consumer.Options{
 		Duration: 10 * time.Minute, MaxPerModel: maxPerModel, MaxTotal: 4, IdleTimeout: time.Hour,
 		ProviderTimeout: 20 * time.Second, QueueTimeout: 30 * time.Second, HealthPolicy: "permissive",
@@ -186,11 +244,21 @@ func newHarness(t *testing.T, maxPerModel int, backendDelay time.Duration) *harn
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.store = h.newStore("storage.json")
 	gw := gateway.New(gateway.Deps{Market: market, Sessions: h.mgr, Keys: h.keys, Bus: h.bus, AdminToken: h.admin, Log: log,
-		Status: func(context.Context) any { return map[string]any{"ok": true} }})
+		Status: func(context.Context) any { return map[string]any{"ok": true} }, Files: h.store})
 	h.gw = httptest.NewServer(gw.Handler())
 	t.Cleanup(h.gw.Close)
 	return h
+}
+
+// newStore opens a user file store on the consumer wallet (a fresh manifest
+// per name).
+func (h *harness) newStore(manifest string) *storage.Store {
+	return storage.NewStore(storage.StoreOptions{
+		Path: filepath.Join(h.dir, manifest), TempDir: filepath.Join(h.dir, "tmp"), Lease: time.Hour, RenewBefore: 10 * time.Minute,
+		Replicas: 1, Encrypt: true, AuditInterval: time.Hour,
+	}, h.consumer, h.ck, h.market, h.mgr, morrpc.DefaultClient(), h.bus, logger())
 }
 
 func (h *harness) do(method, path, key string, body any) (*http.Response, []byte) {

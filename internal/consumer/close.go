@@ -192,6 +192,9 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 				m.log.Warn("cannot inspect session", "session", cs.ID.Hex(), "err", err)
 				continue
 			}
+			if m.opt.Leased != nil && m.opt.Leased(s.ModelID) {
+				continue // a storage lease: its owner reconciles it
+			}
 		} else {
 			s.EndsAt = cs.EndsAtTime()
 		}

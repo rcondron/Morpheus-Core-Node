@@ -1,10 +1,12 @@
 package morrpc
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math/big"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -35,6 +37,17 @@ type vectors struct {
 	ErrorResponsePlain  string      `json:"errorResponsePlain"`
 	ReportRequest       RPCMessage  `json:"reportRequest"`
 	ReportResponse      RPCResponse `json:"reportResponse"`
+
+	StreamStartRequest     RPCMessage  `json:"streamStartRequest"`
+	StreamStartResponse    RPCResponse `json:"streamStartResponse"`
+	StreamChunkRequest     RPCMessage  `json:"streamChunkRequest"`
+	StreamChunkResponse    RPCResponse `json:"streamChunkResponse"`
+	StreamEndRequest       RPCMessage  `json:"streamEndRequest"`
+	AgentToolsRequest      RPCMessage  `json:"agentToolsRequest"`
+	AgentCallRequest       RPCMessage  `json:"agentCallRequest"`
+	AgentCallResponse      RPCResponse `json:"agentCallResponse"`
+	AgentCallResponsePlain string      `json:"agentCallResponsePlain"`
+	SpeechResponse         RPCResponse `json:"speechResponse"`
 }
 
 func loadVectors(t *testing.T) (*vectors, *wallet.Wallet, *wallet.Wallet) {
@@ -241,4 +254,83 @@ func keys(m map[string]json.RawMessage) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// recoverSigner checks a reference request's signature the way our provider
+// does: clear the signature field, recover the signer.
+func recoverSigner[T any](t *testing.T, raw json.RawMessage, sig func(*T) *HexString) (*T, common.Address) {
+	t.Helper()
+	var req T
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatal(err)
+	}
+	s := *sig(&req)
+	*sig(&req) = HexString{}
+	_, addr, err := RecoverParams(req, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*sig(&req) = s
+	return &req, addr
+}
+
+func TestReferenceUploadStream(t *testing.T) {
+	v, user, prov := loadVectors(t)
+	if len(v.StreamStartRequest.Params) == 0 {
+		t.Skip("vectors predate upload streams")
+	}
+	start, addr := recoverSigner(t, v.StreamStartRequest.Params, func(r *StreamStartReq) *HexString { return &r.Signature })
+	if addr != user.Address() || start.TotalChunks != 3 || start.FileSize != 2500000 || start.ContentType != "audio/mpeg" {
+		t.Fatalf("stream start: signer %s %+v", addr.Hex(), start)
+	}
+	chunk, addr := recoverSigner(t, v.StreamChunkRequest.Params, func(r *StreamChunkReq) *HexString { return &r.Signature })
+	data, _ := base64.StdEncoding.DecodeString(chunk.ChunkData)
+	if addr != user.Address() || chunk.ChunkIndex != 1 || string(data) != "chunk bytes ✓" {
+		t.Fatalf("stream chunk: signer %s %+v", addr.Hex(), chunk)
+	}
+	end, addr := recoverSigner(t, v.StreamEndRequest.Params, func(r *StreamEndReq) *HexString { return &r.Signature })
+	if addr != user.Address() || !strings.Contains(end.AudioRequestParam, `"type":"audio_transcription"`) {
+		t.Fatalf("stream end: signer %s %+v", addr.Hex(), end)
+	}
+
+	id, err := VerifyStreamStart(&v.StreamStartResponse, prov.PublicKey(), user)
+	if err != nil || id != start.StreamID {
+		t.Fatalf("stream start response: %q %v", id, err)
+	}
+	if err := VerifyStreamChunk(&v.StreamChunkResponse, prov.PublicKey(), user, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyStreamChunk(&v.StreamChunkResponse, prov.PublicKey(), user, 2); err == nil {
+		t.Fatal("acknowledgement for the wrong chunk was accepted")
+	}
+	other, _ := wallet.Generate()
+	if _, err := VerifyStreamStart(&v.StreamStartResponse, other.PublicKey(), user); err == nil {
+		t.Fatal("stream start signed by another key was accepted")
+	}
+}
+
+func TestReferenceAgentAndSpeech(t *testing.T) {
+	v, user, prov := loadVectors(t)
+	if len(v.AgentToolsRequest.Params) == 0 {
+		t.Skip("vectors predate agents")
+	}
+	if _, addr := recoverSigner(t, v.AgentToolsRequest.Params, func(r *AgentToolsReq) *HexString { return &r.Signature }); addr != user.Address() {
+		t.Fatal("agent.get_tools signer mismatch")
+	}
+	call, addr := recoverSigner(t, v.AgentCallRequest.Params, func(r *AgentCallReq) *HexString { return &r.Signature })
+	if addr != user.Address() || call.ToolName != "add" || !strings.Contains(call.Message, `"b":40`) {
+		t.Fatalf("agent.call_tool: %s %+v", addr.Hex(), call)
+	}
+	out, err := DecodeAgent(&v.AgentCallResponse, prov.PublicKey(), user)
+	if err != nil || string(out) != v.AgentCallResponsePlain {
+		t.Fatalf("agent response: %q %v", out, err)
+	}
+	payload, err := DecodeInference(&v.SpeechResponse, prov.PublicKey(), user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var audio []byte
+	if err := json.Unmarshal(payload, &audio); err != nil || string(audio) != "AUDIO ✓ bytes" {
+		t.Fatalf("speech chunk: %q %v", audio, err)
+	}
 }

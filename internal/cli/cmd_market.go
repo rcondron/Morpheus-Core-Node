@@ -17,6 +17,7 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/consumer"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/gateway"
+	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
 	"github.com/rcondron/Morpheus-Core-Node/internal/tui"
 	"github.com/rcondron/Morpheus-Core-Node/internal/units"
@@ -79,7 +80,7 @@ func cmdModels(a *App, args []string) error {
 	if !*all {
 		kept := models[:0]
 		for _, m := range models {
-			if m.Bids > 0 {
+			if m.Bids > 0 && !marketplace.IsStorageTags(m.Tags) { // storage: see morcore storage providers
 				kept = append(kept, m)
 			}
 		}

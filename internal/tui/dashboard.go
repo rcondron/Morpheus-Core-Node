@@ -103,6 +103,22 @@ func (m *dashboard) View() string {
 			label.Render("live sessions"), st.Provider.ActiveSessions,
 			label.Render("served"), st.Provider.Requests))
 	}
+	if s := st.Storage; s != nil && (s.Files > 0 || s.Leases > 0) {
+		b.WriteString(fmt.Sprintf("%s %d files · %s   %s %d   %s %d\n",
+			label.Render("storage"), s.Files, humanBytes(uint64(s.Bytes)),
+			label.Render("providers"), s.Providers,
+			label.Render("leases"), s.Leases))
+	}
+	if s := st.StorageSold; s != nil {
+		ipfs := Good.Render("ok")
+		if !s.Healthy {
+			ipfs = Danger.Render("unreachable")
+		}
+		b.WriteString(fmt.Sprintf("%s ipfs %s   %s %d   %s %d · %s\n",
+			label.Render("selling storage"), ipfs,
+			label.Render("users"), s.Users,
+			label.Render("files"), s.Files, humanBytes(s.StoredBytes)))
+	}
 	b.WriteString(label.Render(fmt.Sprintf("rpc %s · block %d", st.RPC, st.Block)) + "\n")
 
 	used := strings.Count(b.String(), "\n")
@@ -256,4 +272,17 @@ func human(n int64) string {
 		return fmt.Sprintf("%.1fk", float64(n)/1e3)
 	}
 	return fmt.Sprint(n)
+}
+
+func humanBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain"
+	"github.com/rcondron/Morpheus-Core-Node/internal/config"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
 	"github.com/rcondron/Morpheus-Core-Node/internal/store"
@@ -26,35 +27,64 @@ import (
 
 // Model maps an on-chain model id to a backend.
 type Model struct {
-	ID          common.Hash
-	Name        string
-	APIURL      string // full chat-completions URL
-	APIKey      string
-	Backend     string // model name sent to the backend
-	MaxSessions int    // concurrent sessions accepted (0 = unlimited)
+	ID             common.Hash
+	Name           string
+	APIType        string // config.API* (empty = OpenAI-compatible)
+	APIURL         string // backend endpoint (see endpointFor)
+	APIKey         string
+	Backend        string // model name sent to the backend
+	MaxSessions    int    // concurrent sessions accepted (0 = unlimited)
+	CapacityPolicy string // config.Capacity* (empty = simple)
+	Parameters     map[string]string
 }
+
+// Type returns the backend API type.
+func (m *Model) Type() string {
+	if m.APIType == "" {
+		return config.APIOpenAI
+	}
+	return m.APIType
+}
+
+// servesUploads reports whether the backend takes uploaded files (audio).
+func (m *Model) servesUploads() bool { return m.Type() == config.APIOpenAI }
 
 // Options configure the provider.
 type Options struct {
 	Models    []Model
+	Agents    []Agent
 	StatePath string
 	Version   string
 	AutoClaim bool
+	HTTP      *http.Client // backend client (tests); default has no timeout
+}
+
+// StorageService sells storage on listings this provider serves (see
+// internal/storage). Storage sessions are leases: they take no model slot,
+// and their requests are the storage.* methods.
+type StorageService interface {
+	Serves(listing common.Hash) bool
+	Admit(ctx context.Context, listing common.Hash, user common.Address) error
+	Handle(ctx context.Context, msg *morrpc.RPCMessage, remote string, send func(*morrpc.RPCResponse) error) error
+	HealthReports(bids map[common.Hash]common.Hash) []morrpc.ModelHealthReport
 }
 
 // Provider serves marketplace sessions.
 type Provider struct {
-	opt  Options
-	w    *wallet.Wallet
-	k    *chain.Contracts
-	tx   *chain.TxSender
-	log  *slog.Logger
-	bus  *events.Bus
-	http *http.Client
+	opt     Options
+	w       *wallet.Wallet
+	k       *chain.Contracts
+	tx      *chain.TxSender
+	log     *slog.Logger
+	bus     *events.Bus
+	http    *http.Client
+	storage StorageService
 
-	models map[common.Hash]*Model
+	uploads uploads
 
 	mu        sync.Mutex
+	models    map[common.Hash]*Model
+	agents    map[common.Hash]*Agent
 	sessions  map[common.Hash]*sessionInfo
 	approvals map[common.Hash][]time.Time
 	slots     map[common.Hash]chan struct{}
@@ -77,6 +107,7 @@ type sessionInfo struct {
 	Out      int64          `json:"outputTokens"`
 	TTFT     []int64        `json:"ttftMs,omitempty"`
 	TPS      []int64        `json:"tpsX1000,omitempty"`
+	LastUsed time.Time      `json:"lastUsed,omitzero"`
 	fetched  time.Time
 }
 
@@ -84,8 +115,8 @@ type sessionInfo struct {
 func New(opt Options, w *wallet.Wallet, k *chain.Contracts, tx *chain.TxSender, bus *events.Bus, log *slog.Logger) *Provider {
 	p := &Provider{
 		opt: opt, w: w, k: k, tx: tx, log: log, bus: bus,
-		http:      &http.Client{Timeout: 0},
-		models:    map[common.Hash]*Model{},
+		http:      opt.HTTP,
+		uploads:   uploads{m: map[string]*upload{}},
 		sessions:  map[common.Hash]*sessionInfo{},
 		approvals: map[common.Hash][]time.Time{},
 		slots:     map[common.Hash]chan struct{}{},
@@ -93,20 +124,80 @@ func New(opt Options, w *wallet.Wallet, k *chain.Contracts, tx *chain.TxSender, 
 		bids:      map[common.Hash]common.Hash{},
 		signerFor: map[common.Address]bool{w.Address(): true},
 	}
-	for i := range opt.Models {
-		m := opt.Models[i]
-		if m.Backend == "" {
-			m.Backend = m.Name
-		}
-		p.models[m.ID] = &m
-		p.health[m.ID] = &health{status: morrpc.HealthHealthy}
+	if p.http == nil {
+		p.http = &http.Client{Timeout: 0}
 	}
+	p.Reload(opt.Models, opt.Agents)
 	p.load()
 	return p
 }
 
+// Reload swaps the served models and agents. Requests in flight keep the
+// definitions they started with; sessions for removed models fail from the
+// next request on, so drop the bid and let sessions drain before removing one.
+func (p *Provider) Reload(models []Model, agents []Agent) (added, removed []common.Hash) {
+	nextModels := make(map[common.Hash]*Model, len(models))
+	for i := range models {
+		m := models[i]
+		if m.Backend == "" {
+			m.Backend = m.Name
+		}
+		nextModels[m.ID] = &m
+	}
+	nextAgents := make(map[common.Hash]*Agent, len(agents))
+	for i := range agents {
+		a := agents[i]
+		nextAgents[a.ID] = &a
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	known := func(id common.Hash) bool { return p.models[id] != nil || p.agents[id] != nil }
+	for id := range nextModels {
+		if !known(id) {
+			added = append(added, id)
+		}
+	}
+	for id := range nextAgents {
+		if !known(id) {
+			added = append(added, id)
+		}
+	}
+	for id := range p.models {
+		if nextModels[id] == nil && nextAgents[id] == nil {
+			removed = append(removed, id)
+		}
+	}
+	for id := range p.agents {
+		if nextModels[id] == nil && nextAgents[id] == nil {
+			removed = append(removed, id)
+		}
+	}
+	p.models, p.agents = nextModels, nextAgents
+	for id := range nextModels {
+		if p.health[id] == nil {
+			p.health[id] = &health{status: morrpc.HealthHealthy}
+		}
+	}
+	return added, removed
+}
+
+func (p *Provider) model(id common.Hash) *Model {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.models[id]
+}
+
+// SetStorage adds a storage service; call it before serving.
+func (p *Provider) SetStorage(s StorageService) { p.storage = s }
+
 // Handle dispatches one MOR-RPC request.
 func (p *Provider) Handle(ctx context.Context, msg *morrpc.RPCMessage, remote string, send func(*morrpc.RPCResponse) error) error {
+	if strings.HasPrefix(msg.Method, "storage.") {
+		if p.storage == nil {
+			return errors.New("this provider does not sell storage")
+		}
+		return p.storage.Handle(ctx, msg, remote, send)
+	}
 	switch msg.Method {
 	case morrpc.MethodPing:
 		return p.ping(msg, send)
@@ -116,6 +207,16 @@ func (p *Provider) Handle(ctx context.Context, msg *morrpc.RPCMessage, remote st
 		return p.prompt(ctx, msg, send)
 	case morrpc.MethodSessionReport:
 		return p.report(ctx, msg, send)
+	case morrpc.MethodStreamStart:
+		return p.streamStart(ctx, msg, send)
+	case morrpc.MethodStreamChunk:
+		return p.streamChunk(ctx, msg, send)
+	case morrpc.MethodStreamEnd:
+		return p.streamEnd(ctx, msg, send)
+	case morrpc.MethodAgentTools:
+		return p.agentTools(ctx, msg, send)
+	case morrpc.MethodAgentCall:
+		return p.agentCall(ctx, msg, send)
 	default:
 		return fmt.Errorf("unsupported method %q", msg.Method)
 	}
@@ -133,9 +234,9 @@ func (p *Provider) ping(msg *morrpc.RPCMessage, send func(*morrpc.RPCResponse) e
 	return send(res)
 }
 
-// servesFor reports whether this node's key may act for an on-chain provider
+// ServesFor reports whether this node's key may act for an on-chain provider
 // address: the address itself, or a contract provider whose owner() is us.
-func (p *Provider) servesFor(ctx context.Context, provider common.Address) bool {
+func (p *Provider) ServesFor(ctx context.Context, provider common.Address) bool {
 	p.mu.Lock()
 	ok, known := p.signerFor[provider]
 	p.mu.Unlock()
@@ -174,55 +275,86 @@ func (p *Provider) sessionRequest(ctx context.Context, msg *morrpc.RPCMessage, r
 	if !bid.Active() {
 		return errors.New("bid is no longer active")
 	}
-	if !p.servesFor(ctx, bid.Provider) {
+	if !p.ServesFor(ctx, bid.Provider) {
 		return errors.New("bid belongs to another provider")
 	}
-	model := p.models[common.Hash(bid.ModelId)]
-	if model == nil {
+	id := common.Hash(bid.ModelId)
+	if p.storage != nil && p.storage.Serves(id) {
+		if err := p.storage.Admit(ctx, id, req.User); err != nil {
+			return err
+		}
+		res, err := morrpc.SessionResponse(msg.ID, req.User, req.BidID, p.k.ChainID, p.w)
+		if err != nil {
+			return err
+		}
+		p.log.Info("approved storage lease", "user", req.User.Hex(), "listing", id.Hex(), "remote", remote)
+		p.bus.Emit(events.Info, "provider", fmt.Sprintf("approved storage lease for %s", short(req.User.Hex())))
+		return send(res)
+	}
+	p.mu.Lock()
+	model, agent := p.models[id], p.agents[id]
+	p.mu.Unlock()
+	var name string
+	var limit int
+	var policy string
+	switch {
+	case model != nil:
+		if p.healthStatus(id) == morrpc.HealthUnhealthy {
+			return errors.New("model backend is currently unavailable")
+		}
+		name, limit, policy = model.Name, model.MaxSessions, model.CapacityPolicy
+	case agent != nil:
+		name, limit, policy = agent.Name, agent.MaxSessions, agent.CapacityPolicy
+	default:
 		return errors.New("model is not served by this provider")
 	}
-	if p.healthStatus(model.ID) == morrpc.HealthUnhealthy {
-		return errors.New("model backend is currently unavailable")
-	}
-	if !p.reserve(model) {
+	if !p.reserve(id, limit, policy) {
 		return errors.New("provider at capacity for this model")
 	}
 	res, err := morrpc.SessionResponse(msg.ID, req.User, req.BidID, p.k.ChainID, p.w)
 	if err != nil {
 		return err
 	}
-	p.log.Info("approved session request", "user", req.User.Hex(), "model", model.Name, "remote", remote)
-	p.bus.Emit(events.Info, "provider", fmt.Sprintf("approved session for %s (%s)", model.Name, short(req.User.Hex())))
+	p.log.Info("approved session request", "user", req.User.Hex(), "model", name, "remote", remote)
+	p.bus.Emit(events.Info, "provider", fmt.Sprintf("approved session for %s (%s)", name, short(req.User.Hex())))
 	return send(res)
 }
 
+// idleWindow is how recently a session must have been used to count against
+// capacity under the idle_timeout policy.
+const idleWindow = 15 * time.Minute
+
 // reserve applies the per-model session limit, counting live sessions and
 // approvals handed out in the last ten minutes that have not shown up yet.
-func (p *Provider) reserve(m *Model) bool {
+func (p *Provider) reserve(id common.Hash, limit int, policy string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	recent := p.approvals[m.ID][:0]
-	for _, t := range p.approvals[m.ID] {
+	recent := p.approvals[id][:0]
+	for _, t := range p.approvals[id] {
 		if now.Sub(t) < 10*time.Minute {
 			recent = append(recent, t)
 		}
 	}
-	p.approvals[m.ID] = recent
-	if m.MaxSessions <= 0 {
-		p.approvals[m.ID] = append(recent, now)
+	p.approvals[id] = recent
+	if limit <= 0 {
+		p.approvals[id] = append(recent, now)
 		return true
 	}
 	live := 0
 	for _, s := range p.sessions {
-		if s.ModelID == m.ID && !s.Closed && s.EndsAt.After(now) {
-			live++
+		if s.ModelID != id || s.Closed || !s.EndsAt.After(now) {
+			continue
 		}
+		if policy == config.CapacityIdleTimeout && now.Sub(s.LastUsed) > idleWindow {
+			continue // idle sessions free their slot
+		}
+		live++
 	}
-	if live+len(recent) >= m.MaxSessions {
+	if live+len(recent) >= limit {
 		return false
 	}
-	p.approvals[m.ID] = append(recent, now)
+	p.approvals[id] = append(recent, now)
 	return true
 }
 
@@ -273,46 +405,84 @@ func (p *Provider) slot(id common.Hash) chan struct{} {
 	return ch
 }
 
+// acquire waits for the session's single request slot: consumers send one
+// request per session at a time and expect providers to serialize the rest.
+func (p *Provider) acquire(ctx context.Context, si *sessionInfo) (release func(), err error) {
+	slot := p.slot(si.ID)
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// authorize loads a live session served by this node and checks that sig
+// (over params with its signature cleared) was made by the session's user.
+// It returns the user's public key, which responses are encrypted to.
+func (p *Provider) authorize(ctx context.Context, id common.Hash, params any, sig morrpc.HexString) (*sessionInfo, []byte, error) {
+	si, err := p.session(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if si.Closed {
+		return nil, nil, errors.New("session is closed")
+	}
+	if time.Now().After(si.EndsAt) {
+		return nil, nil, errors.New("session expired")
+	}
+	if !p.ServesFor(ctx, si.Provider) {
+		return nil, nil, errors.New("session not bound to this provider")
+	}
+	pub, signer, err := morrpc.RecoverParams(params, sig)
+	if err != nil || signer != si.User {
+		return nil, nil, morrpc.ErrInvalidSignature
+	}
+	return si, pub, nil
+}
+
 func (p *Provider) prompt(ctx context.Context, msg *morrpc.RPCMessage, send func(*morrpc.RPCResponse) error) error {
 	var req morrpc.SessionPromptReq
 	if err := json.Unmarshal(msg.Params, &req); err != nil {
 		return fmt.Errorf("invalid prompt: %w", err)
 	}
-	si, err := p.session(ctx, req.SessionID)
+	sig := req.Signature
+	req.Signature = morrpc.HexString{}
+	si, userPub, err := p.authorize(ctx, req.SessionID, req, sig)
 	if err != nil {
 		return err
 	}
-	if si.Closed {
-		return errors.New("session is closed")
+	r, err := parseRequest([]byte(req.Message))
+	if err != nil {
+		e := &emitter{p: p, id: msg.ID, userPub: userPub, send: send, st: &forwardStats{}, start: time.Now()}
+		return e.reject(err)
 	}
-	if time.Now().After(si.EndsAt) {
-		return errors.New("session expired")
-	}
-	if !p.servesFor(ctx, si.Provider) {
-		return errors.New("session not bound to this provider")
-	}
-	sig := req.Signature
-	req.Signature = morrpc.HexString{}
-	userPub, signer, err := morrpc.RecoverParams(req, sig)
-	if err != nil || signer != si.User {
-		return morrpc.ErrInvalidSignature
-	}
-	model := p.models[si.ModelID]
+	return p.serve(ctx, si, r, userPub, msg.ID, send)
+}
+
+// serve runs one request on the session's model and records the outcome.
+func (p *Provider) serve(ctx context.Context, si *sessionInfo, r *request, userPub []byte, id string, send func(*morrpc.RPCResponse) error) error {
+	model := p.model(si.ModelID)
 	if model == nil {
 		return errors.New("model is not served by this provider")
 	}
-
-	// One request per session at a time, as consumers expect.
-	slot := p.slot(si.ID)
-	select {
-	case slot <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	release, err := p.acquire(ctx, si)
+	if err != nil {
+		return err
 	}
-	defer func() { <-slot }()
-
-	st, err := p.forward(ctx, model, []byte(req.Message), userPub, msg.ID, send)
-	p.recordResult(si, model, st, err)
+	defer release()
+	e := &emitter{p: p, id: id, userPub: userPub, send: send, st: &forwardStats{}, start: time.Now()}
+	err = p.forward(ctx, model, r, e)
+	e.st.dur = time.Since(e.start)
+	var br badRequest
+	if errors.As(err, &br) && e.sent == 0 {
+		p.recordResult(si, model, nil, nil) // the request's fault, not the backend's
+		if errors.Is(err, errUnsupported.error) {
+			err = invalid("%s requests are not supported by %s (a %s model)", r.kind, model.Name, model.Type())
+		}
+		return e.reject(err)
+	}
+	p.recordResult(si, model, e.st, err)
 	return err
 }
 
@@ -321,6 +491,7 @@ func (p *Provider) recordResult(si *sessionInfo, m *Model, st *forwardStats, err
 	defer p.mu.Unlock()
 	p.served++
 	si.Requests++
+	si.LastUsed = time.Now()
 	if st != nil {
 		si.In += int64(st.in)
 		si.Out += int64(st.out)
@@ -333,15 +504,18 @@ func (p *Provider) recordResult(si *sessionInfo, m *Model, st *forwardStats, err
 	}
 	p.dirty = true
 	h := p.health[m.ID]
+	if h == nil || st == nil {
+		return
+	}
 	switch {
-	case err == nil && (st == nil || st.status < 400):
+	case err == nil && st.status < 400:
 		h.ok()
-	case st != nil && st.status == http.StatusTooManyRequests:
+	case st.status == http.StatusTooManyRequests:
 		h.limited()
-	case st != nil && st.status >= 400 && st.status < 500 && st.status != 401 && st.status != 403:
+	case st.status == 400 || st.status == 403 || st.status == 413 || st.status == 422:
 		// consumer-side mistakes do not count against backend health
 	default:
-		h.fail()
+		h.fail(st.status)
 	}
 }
 
@@ -365,7 +539,7 @@ func (p *Provider) report(ctx context.Context, msg *morrpc.RPCMessage, send func
 	if err != nil {
 		return err
 	}
-	if !p.servesFor(ctx, si.Provider) {
+	if !p.ServesFor(ctx, si.Provider) {
 		return errors.New("session not bound to this provider")
 	}
 	sig := req.Signature
@@ -408,7 +582,7 @@ type Stats struct {
 func (p *Provider) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	st := Stats{Models: len(p.models), Requests: p.served}
+	st := Stats{Models: len(p.models) + len(p.agents), Requests: p.served}
 	now := time.Now()
 	for _, s := range p.sessions {
 		if !s.Closed && s.EndsAt.After(now) {
@@ -433,9 +607,11 @@ func (p *Provider) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			p.save()
+			p.uploads.expireAll()
 			return
 		case <-save.C:
 			p.save()
+			p.uploads.expire()
 		case <-probe.C:
 			p.refreshBids(ctx)
 			p.probeAll(ctx)
@@ -449,6 +625,12 @@ func (p *Provider) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// Refresh re-reads our bids and probes backends now (after a reload).
+func (p *Provider) Refresh(ctx context.Context) {
+	p.refreshBids(ctx)
+	p.probeAll(ctx)
 }
 
 func (p *Provider) refreshBids(ctx context.Context) {

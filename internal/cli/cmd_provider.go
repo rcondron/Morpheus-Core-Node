@@ -16,6 +16,7 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain"
 	"github.com/rcondron/Morpheus-Core-Node/internal/config"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
+	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/provider"
 	"github.com/rcondron/Morpheus-Core-Node/internal/tui"
 	"github.com/rcondron/Morpheus-Core-Node/internal/units"
@@ -173,13 +174,14 @@ func providerBid(a *App, args []string) error {
 	fs := flag.NewFlagSet("provider bid", flag.ContinueOnError)
 	price := fs.String("price", "", "")
 	pricePerSecond := fs.String("price-per-second", "", "")
+	perGiB := fs.String("price-gib-month", "", "")
 	yes := fs.Bool("yes", false, "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) != 1 || (*price == "" && *pricePerSecond == "") {
-		return usagef("Example: morcore provider bid llama-3.3-70b --price 0.5   (MOR per hour)", "provider bid needs a model and --price")
+	if len(pos) != 1 || (*price == "" && *pricePerSecond == "" && *perGiB == "") {
+		return usagef("Example: morcore provider bid llama-3.3-70b --price 0.5   (MOR per hour; storage: --price-gib-month)", "provider bid needs a model and --price")
 	}
 	e, err := a.providerEnv(true)
 	if err != nil {
@@ -192,7 +194,17 @@ func providerBid(a *App, args []string) error {
 		return err
 	}
 	var perSec *big.Int
-	if *pricePerSecond != "" {
+	quota := marketplace.StorageQuota(model.Tags)
+	if *perGiB != "" {
+		if quota == 0 {
+			return errNotStorage
+		}
+		v, err := units.ParseToken(*perGiB)
+		if err != nil {
+			return err
+		}
+		perSec = priceForGiBMonth(v, quota)
+	} else if *pricePerSecond != "" {
 		v, ok := new(big.Int).SetString(*pricePerSecond, 10)
 		if !ok {
 			return usagef("", "--price-per-second must be an integer amount of MOR wei")
@@ -210,12 +222,30 @@ func providerBid(a *App, args []string) error {
 		return fmt.Errorf("price %s is outside the marketplace range %s – %s", perHour(perSec.String()), perHour(lo.String()), perHour(hi.String()))
 	}
 	fee, _ := e.ro.k.BidFee(ctx)
+	if rated, err := e.ro.market.RatedBids(ctx, model.ID); err == nil {
+		var others []*big.Int
+		for _, rb := range rated {
+			if rb.Bid.Provider != e.w.Address() {
+				others = append(others, rb.Bid.PricePerSecond)
+			}
+		}
+		a.info("Market for %s: %s", model.Alias, marketPrices(others))
+	}
 	configured := false
 	for _, m := range e.cfg.Provider.Models {
 		configured = configured || strings.EqualFold(m.ModelID, model.ID.Hex())
 	}
+	for _, l := range e.cfg.Provider.Storage.Listings {
+		configured = configured || (e.cfg.Provider.Storage.Enabled && strings.EqualFold(l, model.ID.Hex()))
+	}
 	a.info("Offer %s at %s (bid fee %s).", tui.Strong.Render(model.Alias), perHour(perSec.String()), units.MOR(fee))
-	if !configured {
+	if quota > 0 {
+		a.info("That is %s per GiB-month (%s per lease of %s).", units.MOR(perGiBMonth(perSec, quota)), units.MOR(new(big.Int).Mul(perSec, big.NewInt(86400))), config.FormatBytes(quota))
+	}
+	switch {
+	case !configured && quota > 0:
+		a.warn("this node does not serve this storage listing; add it with `morcore provider storage --listing %s`", model.ID.Hex())
+	case !configured:
 		a.warn("this model has no backend in config.toml; consumers will be refused until you add one under [[provider.models]]")
 	}
 	if !*yes && tui.Interactive() && !a.confirm("Post this bid?") {

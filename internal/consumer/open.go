@@ -77,6 +77,12 @@ func (m *Manager) Ping(ctx context.Context, endpoint string, provider common.Add
 
 // authorized mirrors the Diamond's receipt check: the signer must be the
 // provider itself, the owner of a contract provider, or a delegate.
+// Authorized checks that signer may act for an on-chain provider: the
+// provider itself, the owner of a provider contract, or a delegate.
+func (m *Manager) Authorized(ctx context.Context, provider, signer common.Address) error {
+	return m.authorized(ctx, provider, signer)
+}
+
 func (m *Manager) authorized(ctx context.Context, provider, signer common.Address) error {
 	if signer == provider {
 		return nil
@@ -186,8 +192,19 @@ func order(policy string, probes []probe) []probe {
 	}
 }
 
+// openTerms are what a new session is bought with.
+type openTerms struct {
+	duration time.Duration
+	direct   bool // pay the provider from the stake instead of the compute budget
+	lease    bool // a storage lease: outside routing pools and their stake cap
+}
+
+func (m *Manager) routingTerms() openTerms {
+	return openTerms{duration: m.opt.Duration, direct: m.opt.Direct}
+}
+
 // open buys a new session for model from the best available provider.
-func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude map[common.Address]bool, onlyBid common.Hash) (*Session, error) {
+func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude map[common.Address]bool, onlyBid common.Hash, terms openTerms) (*Session, error) {
 	bids, err := m.market.RatedBids(ctx, model.ID)
 	if err != nil {
 		return nil, fmt.Errorf("read bids for %s: %w", model.Alias, err)
@@ -230,7 +247,7 @@ func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude ma
 		}
 	}
 
-	durSec := int64(m.opt.Duration / time.Second)
+	durSec := int64(terms.duration / time.Second)
 	for _, p := range order(m.opt.HealthPolicy, probes) {
 		stake := marketplace.SessionStake(p.bid.Bid.PricePerSecond, durSec, supply, budget)
 		if stake == nil {
@@ -240,7 +257,7 @@ func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude ma
 			reasons = append(reasons, fmt.Sprintf("%s needs %s stake but the wallet holds %s", shortAddr(p.bid.Bid.Provider), mor(stake), mor(balance)))
 			continue
 		}
-		if m.opt.MaxStake != nil && m.opt.MaxStake.Sign() > 0 {
+		if !terms.lease && m.opt.MaxStake != nil && m.opt.MaxStake.Sign() > 0 {
 			locked := m.LockedStake()
 			if new(big.Int).Add(locked, stake).Cmp(m.opt.MaxStake) > 0 {
 				reasons = append(reasons, fmt.Sprintf("stake cap reached (%s locked, %s more needed, cap %s)", mor(locked), mor(stake), mor(m.opt.MaxStake)))
@@ -255,7 +272,7 @@ func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude ma
 		}
 
 		m.emitf(events.Info, "opening %s session with %s (stake %s)", model.Alias, shortAddr(p.bid.Bid.Provider), mor(stake))
-		id, err := m.tx.OpenSession(ctx, stake, m.opt.Direct, sr.Approval, sr.ApprovalSig, m.allowanceTarget(stake))
+		id, err := m.tx.OpenSession(ctx, stake, terms.direct, sr.Approval, sr.ApprovalSig, m.allowanceTarget(stake))
 		if err != nil {
 			return nil, fmt.Errorf("open session on-chain: %w", err)
 		}
@@ -266,7 +283,7 @@ func (m *Manager) open(ctx context.Context, model *marketplace.Model, exclude ma
 		s := &Session{
 			ID: id, ModelID: model.ID, ModelName: model.Alias, BidID: p.bid.Bid.ID, Provider: p.bid.Bid.Provider,
 			Endpoint: morrpc.NormalizeEndpoint(p.bid.Provider.Endpoint), ProviderKey: sr.PubKey,
-			Price: p.bid.Bid.PricePerSecond, Stake: stake, OpenedAt: cs.OpenedAtTime(), EndsAt: cs.EndsAtTime(), Direct: m.opt.Direct,
+			Price: p.bid.Bid.PricePerSecond, Stake: stake, OpenedAt: cs.OpenedAtTime(), EndsAt: cs.EndsAtTime(), Direct: terms.direct,
 		}
 		s.init()
 		m.log.Info("session opened", "model", model.Alias, "session", s.ID.Hex(), "provider", s.Provider.Hex(), "stake", mor(stake), "ends", s.EndsAt.Format(time.Kitchen))

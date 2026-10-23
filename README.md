@@ -4,32 +4,42 @@
 
 `morcore` is a terminal-only compute routing node for the [Morpheus](https://mor.org) decentralized AI
 marketplace on BASE. It gives your AI agents one OpenAI-compatible endpoint, backed by independent
-compute providers and paid for in MOR. It can also sell your own model server's compute to the network.
+compute providers and paid for in MOR. It can also sell compute to the network (your own model server or a
+hosted API you resell) and buy or sell paid IPFS storage.
 
 It is a lightweight alternative to the reference
 [Morpheus-Lumerin-Node](https://github.com/MorpheusAIs/Morpheus-Lumerin-Node) proxy-router and speaks
 the same wire protocol and contracts.
 
-- **Fast and light.** One static ~12 MB binary with no runtime dependencies and no database. It uses about 20 MB
+- **Fast and light.** One static ~13 MB binary with no runtime dependencies and no database. It uses about 20 MB
   of memory under load, and CLI commands start in milliseconds.
 - **Windows, macOS and Linux** on amd64 and arm64, with checksum-verified one-line installers.
 - **Seamless onboarding.** A guided setup creates or imports a wallet, picks a network and RPC endpoint, and
   issues your first agent API key in about a minute. Afterwards, `morcore` opens a live dashboard.
-- **Built for agents.** `/v1/chat/completions` (streaming and non-streaming), `/v1/embeddings` and `/v1/models`
-  work with any OpenAI SDK or agent framework. Point `OPENAI_BASE_URL` at the node and you're done.
+- **Built for agents.** Chat completions (streaming and non-streaming), embeddings, speech, transcription, image
+  generation, decisions, MCP agent tools and files all work with any OpenAI SDK or agent framework. Point
+  `OPENAI_BASE_URL` at the node and you're done.
 - **API keys for every agent.** Each key can have model allowlists, requests-per-minute limits, concurrency
   limits, daily token quotas, expiry and scopes. Keys are stored only as hashes, and changes apply live.
 - **Multi-session concurrency.** Each model gets a pool of marketplace sessions:
   - Requests run in parallel across providers, and the pool scales up automatically under load.
   - If a provider fails before responding, the request fails over to another provider.
   - Sessions are renewed before they expire and closed when idle, and unused MOR comes back automatically.
-- **Provider mode.** Sell inference from vLLM, llama.cpp, Ollama, SGLang, LiteLLM or any OpenAI-compatible server.
+- **Provider mode, like the Lumerin node.** Sell from your own server (vLLM, llama.cpp, Ollama, SGLang, LM Studio,
+  LiteLLM) or resell hosted APIs (Venice, OpenAI, Anthropic Claude, OpenRouter, Groq, Together, Prodia, Hyperbolic…).
+  It covers chat, embeddings, speech, transcription, images and decision models, plus MCP agents. The Lumerin
+  node's `models-config.json` and `agents-config.json` import unchanged, and changes reload without dropping
+  sessions.
+- **Paid IPFS storage.** Storage providers sell space on their Kubo node through the same marketplace and are
+  paid in MOR. Agents keep files with the OpenAI Files API. The node encrypts files to your wallet, renews
+  leases, audits providers with Merkle proofs and checks every download against its CID. See
+  [Storage](#storage).
 - **Wire-compatible.** Verified in both directions against the reference implementation's own code (see
   [Interop](#interop-with-the-reference-node)).
 
 **Contents:** [Install](#install) · [Quick start](#quick-start) · [Agent API](#agent-api) ·
 [API keys](#api-keys) · [How it works](#how-it-works) · [Running a provider](#running-a-provider) ·
-[Commands](#commands) · [Configuration](#configuration) · [Running as a service](#running-as-a-service) ·
+[Storage](#storage) · [Commands](#commands) · [Configuration](#configuration) · [Running as a service](#running-as-a-service) ·
 [Security](#security) · [Architecture](#architecture) · [Development](#development) ·
 [Limitations](#limitations)
 
@@ -119,6 +129,13 @@ The node serves an OpenAI-compatible API, by default on `http://127.0.0.1:8082`.
 | GET    | `/v1/models/{model}`   | One model, by name or `0x…` id                          |
 | POST   | `/v1/chat/completions` | Chat completions, streaming (SSE) or not                |
 | POST   | `/v1/embeddings`       | Embeddings                                              |
+| POST   | `/v1/audio/transcriptions` | Speech to text (multipart, as OpenAI; the audio goes to the provider in signed chunks) |
+| POST   | `/v1/audio/speech`     | Text to speech (audio bytes)                            |
+| POST   | `/v1/images/generations` | Images from image models (Prodia, Hyperbolic, …)       |
+| POST   | `/v1/decisions`        | Decision models                                         |
+| GET    | `/v1/agents/{model}/tools` | An MCP agent's tools                                |
+| POST   | `/v1/agents/{model}/tools/{tool}` | Call an agent tool with JSON arguments        |
+| POST · GET · DELETE | `/v1/files`, `/v1/files/{id}`, `/v1/files/{id}/content` | Files on marketplace storage ([Storage](#storage)) |
 | GET    | `/healthz`             | Liveness (no auth)                                      |
 
 Authenticate with `Authorization: Bearer sk-mor-…` (or `X-Api-Key: sk-mor-…`). Requests and responses use the
@@ -220,7 +237,7 @@ morcore keys revoke research-agent
 | `--concurrency`  | Requests in flight at once (0 = unlimited)                                |
 | `--daily-tokens` | Prompt + completion tokens per UTC day (0 = unlimited)                    |
 | `--expires`      | Lifetime: `12h`, `30d`, … (default: never)                                |
-| `--scopes`       | `inference` (default) · `sessions` (view/open/close sessions) · `admin` (manage keys) |
+| `--scopes`       | `inference` (default) · `storage` (Files API) · `sessions` (view/open/close sessions) · `admin` (manage keys) |
 
 Key commands work whether or not the node is running, and a running node picks up changes within a second.
 
@@ -238,6 +255,8 @@ curl -X POST http://127.0.0.1:8082/admin/keys -H "Authorization: Bearer $(cat ~/
 | `GET /admin/keys` · `POST /admin/keys` · `PATCH /admin/keys/{name\|id}` · `DELETE /admin/keys/{name\|id}` · `POST /admin/keys/{name\|id}/rotate` | admin |
 | `GET /admin/status` · `GET /admin/events` · `GET /admin/models` · `GET /admin/models/{id}/bids` | sessions |
 | `GET /admin/sessions` · `POST /admin/sessions` · `DELETE /admin/sessions/{id}` · `POST /admin/stakes/withdraw` | sessions |
+| `GET /admin/storage` · `GET /admin/storage/offers` · `POST /admin/storage/audit` | storage |
+| `POST /admin/storage/recover` · `POST /admin/provider/reload` | admin |
 
 ## How it works
 
@@ -289,40 +308,116 @@ Chain writes go through a single wallet lock, so concurrent opens and closes nev
 
 ## Running a provider
 
-1. Run an OpenAI-compatible model server, for example vLLM
-   (`vllm serve meta-llama/Llama-3.3-70B-Instruct`), llama.cpp `llama-server`, Ollama, SGLang or LiteLLM.
-2. Run `morcore init` and choose **Provider** (or both). The wizard asks for:
-   - your server's chat-completions URL and model name;
-   - the public `host:3333` that consumers will reach;
-   - the marketplace model listing you serve. Joining an existing listing beats creating a duplicate.
+morcore sells compute the way the reference Lumerin node does. It speaks the same protocol, takes the same
+backend types and reads the same config files.
+
+1. Decide what to sell:
+   - **Your own server:** vLLM (`vllm serve meta-llama/Llama-3.3-70B-Instruct`), llama.cpp `llama-server`,
+     Ollama, SGLang, LM Studio or LiteLLM.
+   - **A hosted API you resell:** Venice, OpenAI, Anthropic, OpenRouter, Groq, Together, DeepInfra, Fireworks,
+     Mistral, Hyperbolic, Prodia and others.
+2. Add it. Interactively, `morcore provider add` lists the backend's models and the matching marketplace listings.
+   Or script it:
+
+   ```sh
+   VENICE_API_KEY=… morcore provider add --preset venice --model llama-3.3-70b \
+       --listing llama-3.3-70b --key-env VENICE_API_KEY --slots 4 --endpoint my.host:3333
+   ANTHROPIC_API_KEY=… morcore provider add --preset anthropic --model <anthropic-model-id> --key-env ANTHROPIC_API_KEY
+   morcore provider add --preset prodia --modality image --model inference.flux.schnell.txt2img.v2 --key-env PRODIA_KEY
+   morcore provider presets        # every preset and what it serves
+   ```
+
+   Already running the Lumerin node? Import its files as they are:
+
+   ```sh
+   morcore provider import models-config.json --agents agents-config.json
+   ```
+
 3. Open TCP port **3333** in your firewall. This is the only port that should be public.
-4. Register and post a bid:
+4. Register and post bids:
 
    ```sh
    morcore provider register                          # stakes the provider minimum
-   morcore provider bid llama-3.3-70b --price 0.5     # MOR per hour
+   morcore provider bid llama-3.3-70b --price 0.5     # MOR per hour; shows the market's prices first
    morcore start
    ```
 
-5. Check on things with `morcore provider status`. Earnings are paid when consumers close sessions. For
-   sessions that ended without a close, collect them with `morcore provider claim`.
+5. Check on things with `morcore provider status` and `morcore doctor`, which probes every backend. Earnings
+   are paid when consumers close sessions; for sessions that ended without a close, the node claims them hourly
+   (or run `morcore provider claim`).
 
-The node relays requests and streams to your backend, signs every response and encrypts it to the consumer. It
-also caps concurrent sessions per model (`max_sessions`), probes backend health (reported in pings), and returns
-signed usage receipts. Several models can be served from one node:
+**Backends.** Each model has an `api_type`, the same values as the reference node:
+
+| `api_type` | Serves | Requests |
+|---|---|---|
+| `openai` | Any OpenAI-compatible endpoint, hosted or your own | chat, embeddings, transcription, speech |
+| `claudeai` | Anthropic's Messages API, translated to and from OpenAI chat (tools, images, thinking, streaming) | chat |
+| `prodia-sd`, `prodia-sdxl`, `prodia-v2` | Prodia image and video jobs | images |
+| `hyperbolic-sd` | Hyperbolic image generation | images |
+| `decisions` | Decision-model APIs | decisions |
+
+**Agents.** `[[provider.agents]]` runs MCP servers (stdio) and sells their tools through `agent.get_tools` and
+`agent.call_tool`, as the reference node does.
+
+**Operating.**
+- Every response is signed and encrypted to the consumer, usage is metered into `usage_from_provider` and
+  signed receipts, and backend health is reported in pings. Bids with no backend show up as
+  `no_model_configured`.
+- Capacity is per model: `max_sessions`, plus `capacity_policy` `simple` or `idle_timeout` (idle sessions stop
+  counting after 15 minutes).
+- `morcore provider reload` (or editing `config.toml`, which is watched) applies model and agent changes to
+  the running node without interrupting open sessions.
+- `MORCORE_PROVIDER_MODELS` and `MORCORE_PROVIDER_AGENTS` accept the reference JSON formats for containers.
 
 ```toml
 [[provider.models]]
-  model_id = "0x…"                                  # marketplace model id (morcore models --all)
+  model_id = "0x…"                                  # marketplace listing (morcore models --all)
   name = "llama-3.3-70b"
-  api_url = "http://localhost:8000/v1/chat/completions"
-  backend_model = "meta-llama/Llama-3.3-70B-Instruct"
-  api_key = ""                                       # if your server needs one
-  max_sessions = 8                                   # 0 = unlimited
+  api_type = "openai"                               # openai | claudeai | prodia-sd | prodia-sdxl | prodia-v2 | hyperbolic-sd | decisions
+  api_url = "https://api.venice.ai/api/v1/chat/completions"
+  api_key = ""                                      # or provider add --key-env
+  backend_model = "llama-3.3-70b"
+  max_sessions = 4                                  # 0 = unlimited
+  capacity_policy = "simple"                        # simple | idle_timeout
 ```
 
 `morcore provider model-register <name>` creates a new listing. `unbid` and `deregister` withdraw bids and
-stake.
+stake. To sell storage as well, see [Storage](#storage).
+
+## Storage
+
+Storage providers sell IPFS storage through the marketplace, and users' nodes buy it.
+
+- **Listings, bids and leases.** A storage listing is a marketplace listing tagged `storage` and
+  `quota:<size>`. A bid prices that quota per second. A **lease** is a session on that bid, paid directly to
+  the provider from the user's stake.
+- **Retention.** The provider pins the user's files on its Kubo node while leases cover them, plus a grace
+  period.
+- **Your side.** Your node encrypts files to your wallet, computes their CIDs itself, renews leases, audits
+  providers with Merkle proofs of random blocks, repairs failing copies and verifies every download.
+
+```sh
+morcore storage providers                 # offers, cheapest per GiB-month first
+morcore storage put report.pdf            # encrypted to your wallet (--public: as is)
+morcore storage ls · get <id> [path] · rm <id> · status · audit · recover
+```
+
+Agents use the OpenAI Files API with a key that has the `storage` scope:
+
+```python
+f = client.files.create(file=open("notes.md", "rb"), purpose="assistants")
+data = client.files.content(f.id).read()
+```
+
+To sell storage, run Kubo next to the node:
+
+```sh
+morcore provider storage --ipfs-api http://127.0.0.1:5001     # checks Kubo, enables storage
+morcore provider storage-listing 100GiB                        # join or create a listing
+morcore provider bid <listing> --price-gib-month 0.2
+```
+
+[docs/storage.md](docs/storage.md) covers the design, costs, settings, protocol and trust model.
 
 ## Commands
 
@@ -338,7 +433,10 @@ stake.
 | `morcore keys list\|create\|show\|update\|rotate\|revoke` | Agent API keys |
 | `morcore sessions list\|open\|close` | Inspect sessions; open one now; close one or `all` |
 | `morcore wallet show\|withdraw\|export` | Balances, withdraw released stake, print the private key |
-| `morcore provider status\|register\|bid\|unbid\|claim\|model-register\|deregister` | Provider operations |
+| `morcore provider add\|models\|remove\|import\|reload\|presets` | What you sell: hosted APIs, your servers, Lumerin configs |
+| `morcore provider storage\|storage-listing` | Sell IPFS storage: check Kubo, join or create a listing |
+| `morcore provider status\|register\|bid\|unbid\|claim\|model-register\|deregister` | On-chain provider operations |
+| `morcore storage put\|ls\|get\|rm\|status\|providers\|audit\|recover` | Files on marketplace storage |
 | `morcore doctor` | Check configuration, wallet, RPC, contracts, balances and ports |
 | `morcore config [show]` | Where configuration lives, or print it |
 | `morcore version` | Version, commit, build date |
@@ -364,6 +462,9 @@ Everything lives in one directory. Override it with `--home` or `MORCORE_HOME`.
 | `apikeys.json` | API key metadata, hashes and usage |
 | `admin.token` | Token for the local admin API |
 | `sessions.json` · `provider_state.json` | Session state for restarts |
+| `storage.json` | Your stored files and storage leases (rebuild with `morcore storage recover`) |
+| `storage_provider.json` | Files this provider stores for users |
+| `tmp/` | Spool for storage uploads and downloads |
 | `wallet.password` | Only if you chose unattended start |
 
 All files are created with owner-only permissions. The defaults are:
@@ -397,10 +498,25 @@ role = "consumer"              # consumer | provider | both
   provider_denylist = []
   auto_withdraw = true
 
+[storage]                      # files you keep on marketplace storage (docs/storage.md)
+  lease = "24h0m0s"
+  renew_before = "30m0s"
+  replicas = 1
+  encrypt = true
+  audit_interval = "6h0m0s"
+  max_stake = "0"
+
 [provider]
   enabled = false
   listen = "0.0.0.0:3333"
   public_endpoint = ""         # host:port registered on-chain
+
+[provider.storage]             # storage you sell (docs/storage.md)
+  enabled = false
+  ipfs_api = "http://127.0.0.1:5001"
+  max_file_size = "4GiB"
+  max_total = "0"
+  grace = "72h0m0s"
 
 [log]
   level = "info"               # debug | info | warn | error
@@ -415,6 +531,7 @@ role = "consumer"              # consumer | provider | both
 | `MORCORE_RPC_URLS` | Comma-separated RPC URLs, overriding `chain.rpc_urls` |
 | `MORCORE_GATEWAY_LISTEN` | Overrides `gateway.listen` |
 | `MORCORE_LOG_LEVEL` | Overrides `log.level` |
+| `MORCORE_PROVIDER_MODELS` · `MORCORE_PROVIDER_AGENTS` | Provider models / agents as the reference node's JSON (replace the config's) |
 | `MORCORE_THEME` | `light` or `dark`, if your terminal's background isn't detected |
 | `NO_COLOR` | Disable colors |
 
@@ -460,7 +577,7 @@ docker run -d --name morcore --stop-timeout 150 -v morcore:/data -e MORCORE_PASS
     -p 127.0.0.1:8082:8082 morcore
 ```
 
-The image is about 18 MB: distroless, non-root, with state in the `/data` volume. Inside the container the API
+The image is about 19 MB: distroless, non-root, with state in the `/data` volume. Inside the container the API
 listens on `0.0.0.0`, so publish it only on `127.0.0.1` or a private network. For provider nodes, also publish
 `-p 3333:3333`.
 
@@ -471,7 +588,9 @@ listens on `0.0.0.0`, so publish it only on `127.0.0.1` or a private network. Fo
   3333 is meant to be public, and only on provider nodes.
 - **Prompts are visible to providers.** Prompts reach the provider signed but not encrypted, because the
   provider has to read them to run the model. Responses come back encrypted to your node. Choose providers you
-  trust for sensitive data (`provider_allowlist`).
+  trust for sensitive data (`provider_allowlist`). Providers reselling a hosted API pass prompts on to that API.
+- **Stored files are encrypted by default.** Storage providers see ciphertext, sizes and CIDs, not names or
+  contents (unless you store a file with `--public`). Keep a provider's Kubo RPC API (port 5001) private.
 - **Limit what a leaked key can do.** Give each agent its own key with the smallest model list and limits that
   work. Use `max_stake` to cap how much MOR can be escrowed at once.
 - **Back up your recovery phrase.** The keystore is encrypted with your password. `wallet.password` (unattended
@@ -487,12 +606,12 @@ listens on `0.0.0.0`, so publish it only on `127.0.0.1` or a private network. Fo
      │  OpenAI API · HTTP :8082                         │  MOR-RPC · TCP :3333
      ▼                                                  ▼
   gateway ── API keys, limits, quotas                provider ── verify, sign, encrypt, meter
-     │                                                  │
-     ▼                                                  ▼
-  session manager ── pools, failover, renewal        your model server (OpenAI-compatible)
-     │  MOR-RPC · TCP
+     │          └─ Files API ─▶ storage store          │      └─ storage.* ─▶ storage server ─▶ Kubo
+     ▼               (encrypt, CID, leases, audits)     ▼
+  session manager ── pools, failover, renewal        backends: OpenAI-compatible, Claude, Prodia,
+     │  MOR-RPC · TCP                                Hyperbolic, decisions · MCP agents
      ▼
-  provider nodes ──▶ models
+  provider nodes ──▶ models · agents · storage
 
   Shared: marketplace (catalog, bid rating) · chain client (BASE JSON-RPC with failover,
   Multicall3, transactions signed behind one wallet lock) · wallet · event bus → dashboard
@@ -506,7 +625,11 @@ listens on `0.0.0.0`, so publish it only on `127.0.0.1` or a private network. Fo
 | `internal/consumer` | Session pools, open/close, prompt streaming, reconciliation |
 | `internal/gateway` | OpenAI-compatible API and admin API |
 | `internal/apikeys` | Key store, limits, quotas, usage |
-| `internal/provider` | Provider handlers, backend relay, health, receipts, claims |
+| `internal/provider` | Provider handlers, backend adapters (all reference api types), uploads, agents, health, receipts, claims |
+| `internal/anthropic` | OpenAI ⇄ Anthropic Messages translation (requests, responses, streams, errors) |
+| `internal/mcp` | Minimal MCP stdio client for agent tools |
+| `internal/storage` | Storage server (provider) and store (user): leases, encryption, audits, repair, recovery |
+| `internal/ipfs` · `ipfs/kubo` | UnixFS importer, CIDs, CAR, Merkle path proofs (Kubo-identical) · Kubo RPC client |
 | `internal/wallet` | BIP-39/32/44 derivation, keystore, signing |
 | `internal/tui`, `internal/cli` | Wizard, dashboard, commands |
 
@@ -526,8 +649,9 @@ make release      # cross-compile 6 targets into dist/ with checksums
 ### Local devnet
 
 `morcore-devnet` simulates the whole marketplace locally: a BASE-like chain with the Diamond, MOR and
-Multicall3 contracts, two providers, and an echo model (or your own backend with `--backend`). No real funds
-are involved.
+Multicall3 contracts, two providers, an echo model (or your own backend with `--backend`), and a 10 GiB storage
+listing on in-memory IPFS (or your Kubo with `--ipfs-api`). No real funds are involved. Once the node runs,
+try `morcore chat` and `morcore storage put <file>`.
 
 ```sh
 make devnet                        # terminal 1
@@ -557,9 +681,11 @@ and publishes the archives and `checksums.txt` to the release. The install scrip
 
 ## Limitations
 
-- Chat completions and embeddings only. The reference node's audio (speech, transcription), agent-tool and
-  chat-history endpoints, and its image-generation backends, are not implemented.
 - TEE attestation is not verified locally. Providers that report `tee_unverified` health are skipped.
-- No chat history storage. The gateway is stateless; agents keep their own context.
+- No chat history storage. The gateway is stateless; agents keep their own context. The reference node's
+  model-metadata (API stack) endpoints and its Docker model manager are not implemented.
+- Storage (`storage.*`) is a morcore extension of MOR-RPC: the reference node does not speak it, so storage
+  providers run morcore. Audits prove possession of random blocks when challenged, not continuous replication;
+  use `storage.replicas` above 1 for files you cannot lose.
 - The protocol is verified against the reference implementation, and the full flow is tested on the local
   devnet. Try BASE Sepolia (`--network testnet`) before committing real MOR.

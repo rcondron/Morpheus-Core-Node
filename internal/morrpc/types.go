@@ -24,6 +24,25 @@ const (
 	MethodSessionReq    = "session.request"
 	MethodSessionPrompt = "session.prompt"
 	MethodSessionReport = "session.report"
+
+	// Large uploads (audio files) travel as numbered chunks, then the request.
+	MethodStreamStart = "session.prompt.stream.start"
+	MethodStreamChunk = "session.prompt.stream.chunk"
+	MethodStreamEnd   = "session.prompt.stream.end"
+
+	// MCP agents sold on the marketplace.
+	MethodAgentTools = "agent.get_tools"
+	MethodAgentCall  = "agent.call_tool"
+)
+
+// Request types carried in the "type" field of a session.prompt message; a
+// message without one is a chat completion.
+const (
+	TypeChat          = "chat_completion"
+	TypeEmbeddings    = "embeddings"
+	TypeTranscription = "audio_transcription"
+	TypeSpeech        = "audio_speech"
+	TypeDecisions     = "decisions"
 )
 
 var hexRe = regexp.MustCompile(`^(0[xX])?[0-9a-fA-F]+$`)
@@ -192,6 +211,75 @@ type SessionReportRes struct {
 	SignedReport HexString `json:"signedReport"`
 	Signature    HexString `json:"signature,omitempty"`
 	Timestamp    uint64    `json:"timestamp"`
+}
+
+// Chunked upload messages (reference: "audio streaming"). StreamStartReq and
+// StreamStartRes sign with an always-present signature field, unlike the
+// other requests: the tags differ on purpose.
+type StreamStartReq struct {
+	SessionID   common.Hash `json:"sessionid"`
+	StreamID    string      `json:"streamid"`
+	TotalChunks uint32      `json:"totalchunks"`
+	FileSize    uint64      `json:"filesize"`
+	ContentType string      `json:"contenttype"`
+	Signature   HexString   `json:"signature"`
+	Timestamp   uint64      `json:"timestamp"`
+}
+
+type StreamStartRes struct {
+	StreamID  string    `json:"streamid"`
+	Status    string    `json:"status"`
+	Signature HexString `json:"signature"`
+	Timestamp uint64    `json:"timestamp"`
+}
+
+type StreamChunkReq struct {
+	SessionID   common.Hash `json:"sessionid"`
+	StreamID    string      `json:"streamid"`
+	ChunkIndex  uint32      `json:"chunkindex"`
+	ChunkData   string      `json:"chunkdata"` // base64
+	IsLastChunk bool        `json:"islastchunk"`
+	Signature   HexString   `json:"signature,omitempty"`
+	Timestamp   uint64      `json:"timestamp"`
+}
+
+type StreamChunkRes struct {
+	StreamID   string    `json:"streamid"`
+	ChunkIndex uint32    `json:"chunkindex"`
+	Status     string    `json:"status"`
+	Signature  HexString `json:"signature,omitempty"`
+	Timestamp  uint64    `json:"timestamp"`
+}
+
+// StreamEndReq carries the request (JSON) that consumes the uploaded file;
+// the provider answers with ordinary prompt responses.
+type StreamEndReq struct {
+	SessionID         common.Hash `json:"sessionid"`
+	StreamID          string      `json:"streamid"`
+	AudioRequestParam string      `json:"audiorequestparam"`
+	Signature         HexString   `json:"signature,omitempty"`
+	Timestamp         uint64      `json:"timestamp"`
+}
+
+type AgentCallReq struct {
+	SessionID common.Hash `json:"sessionid"`
+	ToolName  string      `json:"toolname"`
+	Message   string      `json:"message"` // JSON tool arguments
+	Signature HexString   `json:"signature,omitempty"`
+	Timestamp uint64      `json:"timestamp"`
+}
+
+type AgentToolsReq struct {
+	SessionID common.Hash `json:"sessionid"`
+	Signature HexString   `json:"signature,omitempty"`
+	Timestamp uint64      `json:"timestamp"`
+}
+
+// AgentRes answers both agent methods; Message is encrypted to the user.
+type AgentRes struct {
+	Message   string    `json:"message"`
+	Signature HexString `json:"signature,omitempty"`
+	Timestamp uint64    `json:"timestamp"`
 }
 
 // AIEngineError is the (encrypted) body of a signed provider error: the

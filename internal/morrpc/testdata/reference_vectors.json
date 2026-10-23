@@ -1,15 +1,44 @@
 {
+  "agentCallRequest": {
+    "id": "14",
+    "method": "agent.call_tool",
+    "params": {
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "toolname": "add",
+      "message": "{\"a\":2,\"b\":40}",
+      "signature": "0x31ac6180e6b26928b4cb6845668a37cffc58ad26f7a5afb007309e75401281561ca89ef867b504035863d0a6b052887c892bf9b1ea66a0f13bfc91d0f43d074600",
+      "timestamp": 1792723774225
+    }
+  },
+  "agentCallResponse": {
+    "id": "14",
+    "result": {
+      "message": "042bef9f2d8d0225d53ebb54cc0d88f79fa0d221ba4050a1c37f2d338da658afda667252a649d960ee7d86e2e258a31ae85f05b11b8837b166e5ceec9e4aa8a6c336adc268c779a4d24a300c23919075be8d11148a91a4b6e5e96dd71bf52a39a071a986ebd9a621d3fa889f91ddba93ef43a3a0aa28e8a01d19343ebfb7d41742e11212fb00acc19ef2b13f107534108668e9ac084cacfe43ebc99eee5a718953ffcafa3745086a4f6e",
+      "signature": "0xe94c63d9a1c363a1ab3c31561980ce8af9569889e6d86f45b23140be0fa09e5c669c3d44e2dd320836d0ce81a4105a1d7d69bea82340fddc3a96f6d4b7ee5c9501",
+      "timestamp": 1792723774225
+    }
+  },
+  "agentCallResponsePlain": "{\"content\":[{\"type\":\"text\",\"text\":\"42\"}],\"isError\":false}",
+  "agentToolsRequest": {
+    "id": "13",
+    "method": "agent.get_tools",
+    "params": {
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "signature": "0x94b31ae0ef70ff3f32cca99af1dc0b09ea75abe78e4dc315d0030b963e5da6b97d2d67de1ee0e7305d442426fd421faaddd95fcd1febddea3173f781fdfbcd6a01",
+      "timestamp": 1792723774225
+    }
+  },
   "bidId": "0xabababababababababababababababababababababababababababababababab",
   "chainId": "84532",
   "errorResponse": {
     "id": "3",
     "result": null,
     "error": {
-      "message": "048661da591e97110117a6ab7bd34e25e51447ab044aac5ea979283a15c72e0ac82f8153e65887061bfde6216d243a6a3eae8dc337152aba78a33fca591d7ff5acec3f97f42a5cb03aec06fc3f328953a987763281793e8bbbc176a344402644d0b88538042b2f71a78676a30bb8786828e63940a52fb000c67c101bdda6cb17a1a4616274866a96e825d1d5ca3e31996f8793c414465741a8925900a4d65cdd7230bdd7281bb82bf99d11d86d672628bf6d0a970f1b1044cfc23ecde3",
+      "message": "045a41b3e5c2ec94c00291863b072a27f3bb02b9e3b16cfb036477d4a6c893508f976a5c42bcfb191c1dc38cdbbb71cf3143a1f4782b6c96baa2d2b78dd4fe456487a741ab48952d6c8329af3d538e264d74333bcb739bc648d3f4ef7b292031636c6e195a0c84d86bbdbefb7b7f382b89df542b782a2d2356442170c41220be0829744cc85426652224eed862d1f98a0d99b3e0bc4b8420ac04c8f72850a7bfdf84144495b6c061c2ff858cf9d29b67a1d5b7936608afd20310867548",
       "code": 400,
       "data": {
-        "timestamp": 1792595244717,
-        "signature": "0xcf6a6a2745063d1d64dcdd373426d2db52a1bd1862c51173d495a0b2879934ec7e4ab1e63747d28ebf9b544d8ab1c9df5c3316b54cc6ff3951efeacb1642bf8800"
+        "timestamp": 1792723774223,
+        "signature": "0xbc121bdafd6a3d69554f3913d854bd460ada78fa521c67f2f32c4724e858c0d8491f95452c2ef86a215b44c2f6378c032f4ba1eeddb4465aad79dfa656c0e94701"
       }
     }
   },
@@ -42,27 +71,27 @@
   "promptDoneResponse": {
     "id": "3",
     "result": {
-      "message": "04ccba32ba77c7fdef9e2d3cb8141ff7772d1d41150ffdef5390d30580cace34c6219c6021a6d6a2a68837ca86857f3c7b99ba8b8c5d013a6d569df3d01feabd2bca904e5049e8d05e80ff48c7422172a36b44a361025b3b913fc601a3e7af830969294484262093a131dcfee05590d644a08bc651233e04cb",
-      "signature": "0xe15de4baa29dbd115eabf098927472a300b64237ae76f7f44a7bc2f60dbaedfe4a233ae69885a978f6cb1c592aaddca8e842e746cefea48d1622357c280f719401",
-      "timestamp": 1792595244717
+      "message": "04827dfa2fd18d16a0f490349f11d259d4200abf793b8d13683e8f68c6ebe1c5d24a0fc9516af160dd0bb469bd75f767dd0a29826bc40553594bc19f1679110571d4d25af8318bb740beff87fbf00dd9cf0d64c259aab039467623d5e71a6200a58f9a29a47e7afa06d5a34442aaadbca53ca19a3201e420b2",
+      "signature": "0x88df14557e4efd98b82e34655df4c4a69679c17bf8d0ab6c809b0fcffc19fd4067746f8d2f2d97f3b786373f8033e0cc2e8992ff303ca326b9cfc5095723ab7c00",
+      "timestamp": 1792723774223
     }
   },
   "promptRequest": {
     "id": "3",
     "method": "session.prompt",
     "params": {
-      "signature": "0xef2bbe6f1d3e828ac80187b81d7745360a567f9838b92b696cc19e82124f885942948c43dcfdc5cc970d97cba13176299711a25ff134863d03d674dc7d1a5bda01",
+      "signature": "0x1dcef551b58259a9a6fda96aaa787a3ab0862a3a34695a75feb2251206a6e6740f6314502bca0483e2fc1b74cebddc8d4afea775c8216f0bb46156f0bb5c2ee101",
       "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
       "message": "{\"messages\":[{\"content\":\"hi \\u003cb\\u003e\\u0026\\u003c/b\\u003e ünïcode ✓\",\"role\":\"user\"}],\"model\":\"x\",\"stream\":true}",
-      "timestamp": 1792595244717
+      "timestamp": 1792723774223
     }
   },
   "promptResponse": {
     "id": "3",
     "result": {
-      "message": "044b381447634cf20683a0521a7254af930eb5c4ff0ffc19cfc969d1928db7f2bf0f9eb6004603c174412bb5431049ade5227a1fa5875293a723e8a3e5cf7ee81e3bee27acb6e55e07067412c12bb278a39b1c7c18431fc01d3efa5d96c2a92f813b526f9fb53f98cbcf3418b57dd01827078466b5e04c64d50f7beaf0bc0ae4ce2f1154c85a867bf9fbc939421d502b1d37ae23788c412ed0516e97cdd5d6d02d7d1987ed2d6dc82efee85b7e7e653eeb5305bcbf5d05a31767ed9e91d3e9f2fe123f9da175e0125c2fe4554e103fd359f185a9ce3fdc997fd4f541865ffda2f2633c92a489546b7b076c6c84a4f88815e9ddb8a1793f",
-      "signature": "0x2794b3cdf877c907e7943e6feed542ccfccc0f529bec47a70cf564fe321538522a2b93f747e5db0678d038b74a2197e4035c8afad792cf3f9bde5e7a2473e2df01",
-      "timestamp": 1792595244717
+      "message": "04411eabebb9226c8746a28884b92cd0817ff4cfe02525001fb26e9dafb42460cc48c5782a4df67a1579d9ee28e1cef43d2736c3bc4ca65929ed2ce99893ecf7ae17e04244d554ac6781bb857cb5cc5594d9e95eab139ffaec08994587ebde7cb084812346e2a01632b200c17d0e889e37bcbc66910abaeee1f9056ab6aad010f744a22e4420e4646fef6799db21dd59c42d9ca140595a97fef37ddee4c18977624e72c1899c9f20ffcb9e4968c6f878ff12e41d9d56b6e47d3107f15fc78d88c8a08eedf21fd0b143c849dbd8da4ca376dbea097f86cfc881f27587c0872d22184770981a280bdaf76570e4459e368c30d70b5289bc4c",
+      "signature": "0x0f6a212217a34f447f8cb6e92db7ae4b05d2191f3ba2969586c153f38e8de4556db322e2296c8a00bca3a1ef509afe1136b89ef15c2c0b7b3eaa3772b739372f01",
+      "timestamp": 1792723774223
     }
   },
   "promptResponsePlain": "{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \u003cworld\u003e \u0026 ✓\"}}]}",
@@ -73,18 +102,18 @@
     "id": "4",
     "method": "session.report",
     "params": {
-      "signature": "0xeed796e3eb1c42ea7b17a310701163d053af0cf45e7e853d432382c42e5d7cce12b7d215c151883631db8bfc495385ad9d0953f44d4245ee2082a6c2e43d48eb00",
+      "signature": "0x7293ad602a93999717caf479b08f4443974e4bbec02c654f6428a5691a20602049d10a71e56dcb0bbc61aebf71ddd6fda52e0ac5a649ddce798a1e62f05c1ed900",
       "message": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-      "timestamp": 1792595244717
+      "timestamp": 1792723774224
     }
   },
   "reportResponse": {
     "id": "4",
     "result": {
-      "message": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0000000000000000000000000000000000000000000000000000000000014a34000000000000000000000000000000000000000000000000000001a15f00b6ad00000000000000000000000000000000000000000000000000000000000005dc00000000000000000000000000000000000000000000000000000000000000fa000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000014",
-      "signedReport": "0x039721d37c8b7983b74c7884c5af7b7dc86f598e2beba59b38c52187b5503a0a622060adcadd1d4386262168fd5eed8f58cc3353d40b490df5cae45d816b984e1c",
-      "signature": "0x8b89d3e87ca82b1b415f9d154e163c302d3057f6b3ea1246ca46de74655cec68015fe6defaa6043b0fc6207f2d598221384ca8725b7442b3ab9845e7d5e5df2b01",
-      "timestamp": 1792595244717
+      "message": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0000000000000000000000000000000000000000000000000000000000014a34000000000000000000000000000000000000000000000000000001a166a9eb1000000000000000000000000000000000000000000000000000000000000005dc00000000000000000000000000000000000000000000000000000000000000fa000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000014",
+      "signedReport": "0x424231162f8ea5e2c3d479f1005f99c3c6df155958c6b951f76bbc597b5480ce026415d8e1ae60628c73aac5a175d44891990241976ce67608cd82872ff0653d1b",
+      "signature": "0x631c612c2170039a8bebc3b7d40f1dfc42fa94b8c1600abf4825c9ec0c78f76d270b495c2a10b2e6d9ab6f02127a508cbf1dd77b2c82e91293aacffd630949d401",
+      "timestamp": 1792723774224
     }
   },
   "sessionId": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
@@ -92,11 +121,11 @@
     "id": "2",
     "method": "session.request",
     "params": {
-      "signature": "0x962cde9ef131a7fc15fc7ee56fa7beeaf1efdc39f078af298ddaf233cd76af0315ac525258fda7378e4731526d53f77c30b6e8f58305dbb04e5e1f3fd42ea85101",
+      "signature": "0x6ac3be4d8d5eed4946e20a3fefda5e5d3b2cd030239b3ee5cff435f04d4273b1719913000e25c4cf8794295ba74903c51596b2865d026674ffb096d31fc154fb00",
       "user": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
       "key": "0x044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
       "spend": "123456789",
-      "timestamp": 1792595244716,
+      "timestamp": 1792723774222,
       "bidid": "0xabababababababababababababababababababababababababababababababab"
     }
   },
@@ -104,11 +133,75 @@
     "id": "2",
     "result": {
       "message": "0x04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a",
-      "approval": "0xabababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000014a3400000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a000000000000000000000000000000000000000000000000000001a15f00b6ac",
-      "approvalSig": "0x3adf8d7782847f3fbfa7b7ea33073e9deb9eb38c642b30fef472cd295dca81e1142b63d5a0a6a0f0ec64f0b93c9333ccb9445cc9a89644985ff518be64f8bce51c",
+      "approval": "0xabababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000014a3400000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a000000000000000000000000000000000000000000000000000001a166a9eb0e",
+      "approvalSig": "0xc936db7483194713d09c2a46eebb161600f8b6c8b01ae4a15ff6ce1979e4bedb177fa8c889f075b3005af601f1cd626679f59bfe3195192eab2619bb7156786f1c",
       "user": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
-      "timestamp": 1792595244716,
-      "signature": "0xc7dcbb4f250ecc92b9fba75fe69149f7607ef70af3f7d98f5416e2e27b12da2a318bca58ef8c684127fafab20295f34e08d5a9c7a90b52f199053079ec79fd8301"
+      "timestamp": 1792723774222,
+      "signature": "0x25bb72a22d2ce2b3e298d59b2006939ae4651ef921dd739acc49d07aeb8ed3cb44e53a56491ab345eb2367ca3283e6c52e9a22d73df19065500141336d9b363001"
+    }
+  },
+  "speechResponse": {
+    "id": "15",
+    "result": {
+      "message": "0429dcf56400702bdd686a6ead3edec0537533462d3ba1a945a30467644868b0a4e720bf2dbbcc45726c6d3b37187d71ea94aaac7cb1932a4e46aed41e3fe7c0e8d383996d9b9fe0e557128254f739e74f4f488501dee2d2b3d55b89bfbf1164358c0fb814c40db7e8ae3bfa8b04f06238de278a1d148634ed3c225c822b56ec40cf43ad3da0e8",
+      "signature": "0xd552b81fb88672aa099a1c47f3bdbaf6fc13c0e6d7e6b68106d77334c0a0717c1d6c3faf7ea4d3706fcf1d46f6a5bd8741e57b2d0a07e3a2462cfd55318b7c9c00",
+      "timestamp": 1792723774225
+    }
+  },
+  "streamChunkRequest": {
+    "id": "11",
+    "method": "session.prompt.stream.chunk",
+    "params": {
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "streamid": "0123abcd0123abcd0123abcd0123abcd",
+      "chunkindex": 1,
+      "chunkdata": "Y2h1bmsgYnl0ZXMg4pyT",
+      "islastchunk": false,
+      "signature": "0xfd0838e40776f8a50b6a95bde1fcd3bec7c5d58dc4a891a550a5a9b3a55b8bc305db56fec2f95ce114fe471bcfe1d76922d526f7e9247405da144d12f664b1dc01",
+      "timestamp": 1792723774224
+    }
+  },
+  "streamChunkResponse": {
+    "id": "11",
+    "result": {
+      "streamid": "0123abcd0123abcd0123abcd0123abcd",
+      "chunkindex": 1,
+      "status": "received",
+      "signature": "0x9fa8ef8f8760cfc8d11bc3548914dd82b1f6390a994860cd4c55bd95d2bd235c75d7e530080a09f9aedde7eca38e2f8a40c8e3fad8b9fbfac55d87eb571703c301",
+      "timestamp": 1792723774224
+    }
+  },
+  "streamEndRequest": {
+    "id": "12",
+    "method": "session.prompt.stream.end",
+    "params": {
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "streamid": "0123abcd0123abcd0123abcd0123abcd",
+      "audiorequestparam": "{\"Model\":\"whisper\",\"Language\":\"en\",\"type\":\"audio_transcription\"}",
+      "signature": "0xc0126056921591347ff70fad162f3ae645406de80a702c7727946e547c7fa3e94d91ba8426f8bce8d2eadde564dcd87cb943b2e0872f399638a033b1514f2be800",
+      "timestamp": 1792723774225
+    }
+  },
+  "streamStartRequest": {
+    "id": "10",
+    "method": "session.prompt.stream.start",
+    "params": {
+      "sessionid": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "streamid": "0123abcd0123abcd0123abcd0123abcd",
+      "totalchunks": 3,
+      "filesize": 2500000,
+      "contenttype": "audio/mpeg",
+      "signature": "0x5505b633c17b3ec7e14475cfc824e4ec761b4b33b3d13ef00fe8060443d8e9b600f932486ca115b743c91b315cb64abe83565911039e8c00c5dd46cdd7c0a60401",
+      "timestamp": 1792723774224
+    }
+  },
+  "streamStartResponse": {
+    "id": "10",
+    "result": {
+      "streamid": "0123abcd0123abcd0123abcd0123abcd",
+      "status": "started",
+      "signature": "0x9f8a8c0c99b8bba63c8eb40b88e9b9ad4fbcbf1d8f4b545ca57979248282dac77ee430147de8abbe631ad6f1ac4d63e74bd12e455785e895f3fd625a96012c9d00",
+      "timestamp": 1792723774224
     }
   },
   "userAddr": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",

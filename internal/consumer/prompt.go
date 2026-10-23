@@ -34,16 +34,21 @@ func (e *ProviderError) Unwrap() error { return e.Err }
 // onChunk with each decrypted response payload (a JSON chunk, a full JSON
 // response, or an error body). It returns token/latency statistics.
 func (m *Manager) Send(ctx context.Context, l *Lease, body []byte, onChunk func(payload []byte) error) (*Result, error) {
-	s := l.Session
-	msg, err := morrpc.PromptRequest(newRequestID(), s.ID, body, m.w)
+	msg, err := morrpc.PromptRequest(newRequestID(), l.Session.ID, body, m.w)
 	if err != nil {
 		return nil, err
 	}
+	return m.exchange(ctx, l, msg, body, onChunk)
+}
+
+// exchange sends a request whose answer is a stream of prompt responses.
+func (m *Manager) exchange(ctx context.Context, l *Lease, msg *morrpc.RPCMessage, body []byte, onChunk func(payload []byte) error) (*Result, error) {
+	s := l.Session
 	res := &Result{InputTokens: estimatePromptTokens(body)}
 	start := time.Now()
 	var usageIn, usageOut, contentChars int
 	clientErr := false
-	err = m.rpc.Stream(ctx, s.Endpoint, msg, m.opt.ProviderTimeout, m.opt.ProviderTimeout, func(r *morrpc.RPCResponse) (bool, error) {
+	err := m.rpc.Stream(ctx, s.Endpoint, msg, m.opt.ProviderTimeout, m.opt.ProviderTimeout, func(r *morrpc.RPCResponse) (bool, error) {
 		payload, err := morrpc.DecodeInference(r, s.ProviderKey, m.w)
 		if err != nil {
 			return true, err

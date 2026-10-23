@@ -25,9 +25,11 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/consumer"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
 	"github.com/rcondron/Morpheus-Core-Node/internal/gateway"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/kubo"
 	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
 	"github.com/rcondron/Morpheus-Core-Node/internal/provider"
+	"github.com/rcondron/Morpheus-Core-Node/internal/storage"
 	"github.com/rcondron/Morpheus-Core-Node/internal/store"
 	"github.com/rcondron/Morpheus-Core-Node/internal/units"
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
@@ -43,6 +45,8 @@ type Node struct {
 	Market   *marketplace.Market
 	Sessions *consumer.Manager
 	Provider *provider.Provider
+	Store    *storage.Store  // the user's files on marketplace storage (consumer role)
+	Storage  *storage.Server // storage sold by this provider (provider.storage)
 	Keys     *apikeys.Store
 	Bus      *events.Bus
 	Log      *slog.Logger
@@ -58,6 +62,8 @@ type Node struct {
 	mor     *big.Int
 	balAt   time.Time
 	blockAt uint64
+
+	reloadMu sync.Mutex // guards Cfg.Provider during reloads
 }
 
 // New wires the node's components (no network activity yet).
@@ -91,21 +97,78 @@ func New(cfg *config.Config, w *wallet.Wallet, log *slog.Logger) (*Node, error) 
 			IdleTimeout: s.IdleTimeout.Duration, RenewBefore: s.RenewBefore.Duration, Direct: s.DirectPayment,
 			ProviderTimeout: s.ProviderTimeout.Duration, QueueTimeout: s.QueueTimeout.Duration, HealthPolicy: s.HealthPolicy,
 			CloseOnShutdown: s.CloseOnShutdown, AutoWithdraw: s.AutoWithdraw, StorePath: cfg.Path(config.SessionsFile),
+			Leased: n.isStorageListing,
 		}, w, k, tx, n.Market, morrpc.DefaultClient(), bus, log.With("component", "sessions"))
+		st := cfg.Storage
+		storageStake, _ := units.ParseToken(st.MaxStake)
+		var allow []common.Address
+		for _, a := range st.Providers {
+			allow = append(allow, common.HexToAddress(a))
+		}
+		n.Store = storage.NewStore(storage.StoreOptions{
+			Path: cfg.Path(config.StorageFile), TempDir: cfg.Path(config.TempDir), Lease: st.Lease.Duration,
+			RenewBefore: st.RenewBefore.Duration, Replicas: st.Replicas, Encrypt: st.Encrypt,
+			AuditInterval: st.AuditInterval.Duration, MaxStake: storageStake, Providers: allow,
+		}, w, k, n.Market, n.Sessions, morrpc.DefaultClient(), bus, log.With("component", "storage"))
 	}
 	if cfg.ProviderEnabled() {
-		var models []provider.Model
-		for _, m := range cfg.Provider.Models {
-			models = append(models, provider.Model{
-				ID: common.HexToHash(m.ModelID), Name: m.Name, APIURL: m.APIURL, APIKey: m.APIKey,
-				Backend: m.BackendModel, MaxSessions: m.MaxSessions,
-			})
-		}
+		models, agents := ProviderOfferings(cfg)
 		n.Provider = provider.New(provider.Options{
-			Models: models, StatePath: cfg.Path(config.ProviderFile), Version: buildinfo.ProtocolVersion(), AutoClaim: true,
+			Models: models, Agents: agents, StatePath: cfg.Path(config.ProviderFile), Version: buildinfo.ProtocolVersion(), AutoClaim: true,
 		}, w, k, tx, bus, log.With("component", "provider"))
+		if ps := cfg.Provider.Storage; ps.Enabled {
+			kc, err := kubo.New(ps.IPFSAPI, kubo.WithAuthorization(ps.IPFSAuth))
+			if err != nil {
+				return nil, fmt.Errorf("provider.storage.ipfs_api: %w", err)
+			}
+			maxFile, _ := config.ParseBytes(ps.MaxFileSize)
+			maxTotal, _ := config.ParseBytes(ps.MaxTotal)
+			var listings []common.Hash
+			for _, l := range ps.Listings {
+				listings = append(listings, common.HexToHash(l))
+			}
+			n.Storage = storage.NewServer(storage.ServerOptions{
+				Listings: listings, MaxFileBytes: maxFile, MaxTotal: maxTotal, Grace: ps.Grace.Duration,
+				AcceptStipend: ps.AcceptStipend, Gateway: ps.Gateway, StatePath: cfg.Path(config.StorageState),
+				Version: buildinfo.ProtocolVersion(),
+			}, w, k, kc, n.Provider.ServesFor, bus, log.With("component", "storage"))
+			n.Provider.SetStorage(n.Storage)
+		}
 	}
 	return n, nil
+}
+
+// isStorageListing reports whether a model is a storage listing, whose
+// sessions the store manages as leases. When the listing cannot be read it
+// answers yes: leaving a session alone is safe, routing requests to a
+// storage provider is not.
+func (n *Node) isStorageListing(id common.Hash) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	m, err := n.K.GetModel(ctx, id)
+	if err != nil {
+		return true
+	}
+	return marketplace.IsStorageTags(m.Tags)
+}
+
+// ProviderOfferings converts the configured models and agents for the provider.
+func ProviderOfferings(cfg *config.Config) ([]provider.Model, []provider.Agent) {
+	var models []provider.Model
+	for _, m := range cfg.Provider.Models {
+		models = append(models, provider.Model{
+			ID: common.HexToHash(m.ModelID), Name: m.Name, APIType: m.APIType, APIURL: m.APIURL, APIKey: m.APIKey,
+			Backend: m.BackendModel, MaxSessions: m.MaxSessions, CapacityPolicy: m.CapacityPolicy, Parameters: m.Parameters,
+		})
+	}
+	var agents []provider.Agent
+	for _, a := range cfg.Provider.Agents {
+		agents = append(agents, provider.Agent{
+			ID: common.HexToHash(a.AgentID), Name: a.Name, Command: a.Command, Args: a.Args, Env: a.Env,
+			MaxSessions: a.MaxSessions, CapacityPolicy: a.CapacityPolicy,
+		})
+	}
+	return models, agents
 }
 
 // EnsureAdminToken loads or creates the local admin token used by the CLI.
@@ -208,7 +271,11 @@ func (n *Node) Run(ctx context.Context, ready func()) error {
 		gw := gateway.New(gateway.Deps{
 			Market: n.Market, Sessions: n.Sessions, Keys: n.Keys, Bus: n.Bus, AdminToken: n.AdminToken,
 			Status: func(ctx context.Context) any { return n.Status(ctx) }, CORS: n.Cfg.Gateway.CORSOrigins,
-			Log: n.Log.With("component", "api"),
+			Log: n.Log.With("component", "api"), Files: n.Store,
+			ReloadProvider: func(ctx context.Context) (any, error) {
+				added, removed, err := n.ReloadProvider(context.WithoutCancel(ctx))
+				return map[string]any{"added": nonNil(added), "removed": nonNil(removed)}, err
+			},
 		})
 		wg.Add(1)
 		go func() {
@@ -233,6 +300,13 @@ func (n *Node) Run(ctx context.Context, ready func()) error {
 			n.Provider.Run(runCtx)
 		}()
 		n.Log.Info("provider listening", "addr", n.ProviderAddr, "public", n.Cfg.Provider.PublicEndpoint)
+		if n.Storage != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n.Storage.Run(runCtx)
+			}()
+		}
 	}
 	if n.Sessions != nil {
 		wg.Add(1)
@@ -244,6 +318,11 @@ func (n *Node) Run(ctx context.Context, ready func()) error {
 			}
 			cancel()
 			n.Sessions.Run(runCtx)
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n.Store.Run(runCtx)
 		}()
 		go func() {
 			if _, err := n.Market.Models(runCtx); err != nil {
@@ -290,12 +369,63 @@ func listen(addr string) (net.Listener, error) {
 	return ln, err
 }
 
+// ReloadProvider re-reads config.toml and swaps the provider's models and
+// agents without dropping sessions. A file that fails to load or validate
+// leaves the running set untouched.
+func (n *Node) ReloadProvider(ctx context.Context) (added, removed []string, err error) {
+	if n.Provider == nil {
+		return nil, nil, errors.New("the provider role is not enabled on this node")
+	}
+	cfg, err := config.Load(n.Cfg.Home)
+	if err != nil {
+		return nil, nil, fmt.Errorf("models not reloaded, previous set still in force: %w", err)
+	}
+	models, agents := ProviderOfferings(cfg)
+	a, r := n.Provider.Reload(models, agents)
+	n.reloadMu.Lock()
+	n.Cfg.Provider.Models, n.Cfg.Provider.Agents = cfg.Provider.Models, cfg.Provider.Agents
+	n.reloadMu.Unlock()
+	for _, id := range a {
+		added = append(added, id.Hex())
+	}
+	for _, id := range r {
+		removed = append(removed, id.Hex())
+	}
+	if len(a)+len(r) > 0 {
+		n.Log.Info("provider offerings reloaded", "added", len(a), "removed", len(r))
+		n.Bus.Emit(events.Info, "provider", fmt.Sprintf("reloaded offerings: %d added, %d removed", len(a), len(r)))
+		go n.Provider.Refresh(ctx)
+	}
+	return added, removed, nil
+}
+
+// watchConfig reloads provider offerings when config.toml changes, so edits
+// take effect without a restart (which would cut open sessions).
+func (n *Node) watchConfig(ctx context.Context, last *time.Time) {
+	st, err := os.Stat(n.Cfg.Path(config.FileName))
+	if err != nil || !st.ModTime().After(*last) {
+		return
+	}
+	first := last.IsZero()
+	*last = st.ModTime()
+	if first || n.Provider == nil {
+		return
+	}
+	if _, _, err := n.ReloadProvider(ctx); err != nil {
+		n.Log.Warn("config.toml changed but could not be applied", "err", err)
+	}
+}
+
 func (n *Node) background(ctx context.Context) {
 	n.refreshBalances(ctx)
 	flush := time.NewTicker(15 * time.Second)
 	bal := time.NewTicker(time.Minute)
+	watch := time.NewTicker(5 * time.Second)
 	defer flush.Stop()
 	defer bal.Stop()
+	defer watch.Stop()
+	var cfgSeen time.Time
+	n.watchConfig(ctx, &cfgSeen)
 	evs, unsubscribe := n.Bus.Subscribe()
 	defer unsubscribe()
 	// Session opens/closes move MOR; refresh shortly after so displays track them.
@@ -310,6 +440,8 @@ func (n *Node) background(ctx context.Context) {
 			}
 		case <-bal.C:
 			n.refreshBalances(ctx)
+		case <-watch.C:
+			n.watchConfig(ctx, &cfgSeen)
 		case v := <-evs:
 			if e, ok := v.(events.Event); ok && (e.Kind == "session" || e.Kind == "provider") && soon == nil {
 				soon = time.After(3 * time.Second)
@@ -337,29 +469,31 @@ func (n *Node) refreshBalances(ctx context.Context) {
 
 // Status is a snapshot of the node for the CLI, API and dashboard.
 type Status struct {
-	Version        string              `json:"version"`
-	Network        string              `json:"network"`
-	ChainID        int64               `json:"chainId"`
-	Role           string              `json:"role"`
-	Address        string              `json:"address"`
-	ETH            string              `json:"ethWei"`
-	MOR            string              `json:"morWei"`
-	LockedStake    string              `json:"lockedStakeWei"`
-	Block          uint64              `json:"block"`
-	RPC            string              `json:"rpc"`
-	Gateway        string              `json:"gateway,omitempty"`
-	ProviderListen string              `json:"providerListen,omitempty"`
-	PublicEndpoint string              `json:"publicEndpoint,omitempty"`
-	StartedAt      time.Time           `json:"startedAt"`
-	Sessions       []consumer.Snapshot `json:"sessions"`
-	Pools          []consumer.PoolInfo `json:"pools"`
-	Keys           int                 `json:"activeKeys"`
-	Totals         events.Totals       `json:"totals"`
-	Provider       *provider.Stats     `json:"provider,omitempty"`
-	Requests       []events.Request    `json:"recentRequests"`
-	Events         []events.Event      `json:"recentEvents"`
-	Explorer       string              `json:"explorer"`
-	Models         []marketplace.Model `json:"-"`
+	Version        string               `json:"version"`
+	Network        string               `json:"network"`
+	ChainID        int64                `json:"chainId"`
+	Role           string               `json:"role"`
+	Address        string               `json:"address"`
+	ETH            string               `json:"ethWei"`
+	MOR            string               `json:"morWei"`
+	LockedStake    string               `json:"lockedStakeWei"`
+	Block          uint64               `json:"block"`
+	RPC            string               `json:"rpc"`
+	Gateway        string               `json:"gateway,omitempty"`
+	ProviderListen string               `json:"providerListen,omitempty"`
+	PublicEndpoint string               `json:"publicEndpoint,omitempty"`
+	StartedAt      time.Time            `json:"startedAt"`
+	Sessions       []consumer.Snapshot  `json:"sessions"`
+	Pools          []consumer.PoolInfo  `json:"pools"`
+	Keys           int                  `json:"activeKeys"`
+	Totals         events.Totals        `json:"totals"`
+	Provider       *provider.Stats      `json:"provider,omitempty"`
+	Storage        *storage.StoreStats  `json:"storage,omitempty"`     // files this wallet stores
+	StorageSold    *storage.ServerStats `json:"storageSold,omitempty"` // storage this provider sells
+	Requests       []events.Request     `json:"recentRequests"`
+	Events         []events.Event       `json:"recentEvents"`
+	Explorer       string               `json:"explorer"`
+	Models         []marketplace.Model  `json:"-"`
 }
 
 // Status returns the current node snapshot.
@@ -383,6 +517,14 @@ func (n *Node) Status(_ context.Context) Status {
 		ps := n.Provider.Stats()
 		st.Provider = &ps
 	}
+	if n.Store != nil {
+		ss := n.Store.Stats()
+		st.Storage = &ss
+	}
+	if n.Storage != nil {
+		ss := n.Storage.Stats()
+		st.StorageSold = &ss
+	}
 	return st
 }
 
@@ -391,4 +533,11 @@ func bigStr(v *big.Int) string {
 		return ""
 	}
 	return v.String()
+}
+
+func nonNil(xs []string) []string {
+	if xs == nil {
+		return []string{}
+	}
+	return xs
 }

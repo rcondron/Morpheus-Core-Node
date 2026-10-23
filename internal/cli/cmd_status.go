@@ -5,19 +5,23 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/rcondron/Morpheus-Core-Node/internal/apikeys"
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain"
 	"github.com/rcondron/Morpheus-Core-Node/internal/config"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/kubo"
 	"github.com/rcondron/Morpheus-Core-Node/internal/logx"
+	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/node"
+	"github.com/rcondron/Morpheus-Core-Node/internal/provider"
 	"github.com/rcondron/Morpheus-Core-Node/internal/tui"
 	"github.com/rcondron/Morpheus-Core-Node/internal/units"
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
@@ -68,6 +72,17 @@ func cmdStatus(a *App, args []string) error {
 	if st.Provider != nil {
 		row("Provider", fmt.Sprintf("%s → %s · %d models · %d live sessions · %d requests served",
 			st.ProviderListen, st.PublicEndpoint, st.Provider.Models, st.Provider.ActiveSessions, st.Provider.Requests))
+	}
+	if s := st.Storage; s != nil && (s.Files > 0 || s.Leases > 0) {
+		row("Storage", fmt.Sprintf("%d files · %s · %d providers · %d leases · %s staked", s.Files, config.FormatBytes(uint64(s.Bytes)),
+			s.Providers, s.Leases, units.MOR(parse(s.Staked))))
+	}
+	if s := st.StorageSold; s != nil {
+		health := tui.Good.Render("IPFS ok")
+		if !s.Healthy {
+			health = tui.Danger.Render("IPFS unreachable")
+		}
+		row("Selling storage", fmt.Sprintf("%s · %d users · %d files · %s stored", health, s.Users, s.Files, config.FormatBytes(s.StoredBytes)))
 	}
 	row("RPC", st.RPC)
 	return t.Flush()
@@ -242,26 +257,30 @@ func doctorProvider(ctx context.Context, cfg *config.Config, ro *readOnly, add f
 	default:
 		add("provider", 0, "registered at %s · stake %s", p.Endpoint, units.MOR(p.Stake))
 	}
-	if len(cfg.Provider.Models) == 0 {
-		add("models", 2, "no [[provider.models]] configured")
+	ps := cfg.Provider.Storage
+	if len(cfg.Provider.Models)+len(cfg.Provider.Agents) == 0 && !ps.Enabled {
+		add("models", 2, "nothing to sell yet (morcore provider add, or provider storage)")
 	}
-	client := http.Client{Timeout: 8 * time.Second}
-	for _, m := range cfg.Provider.Models {
-		url := strings.TrimSuffix(m.APIURL, "/chat/completions") + "/models"
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if m.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+m.APIKey)
+	if ps.Enabled {
+		doctorStorage(ctx, ps, ro, add)
+	}
+	models, agents := node.ProviderOfferings(cfg)
+	for _, m := range models {
+		ok, skipped, detail := provider.CheckBackend(ctx, m)
+		st := 0
+		switch {
+		case !ok:
+			st = 2
+		case skipped:
+			st = 1
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			add("backend "+m.Name, 2, "%s unreachable: %v", m.APIURL, err)
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode >= 500 {
-			add("backend "+m.Name, 2, "HTTP %d from %s", resp.StatusCode, url)
+		add("sells "+m.Name, st, "%s · %s", hostOf(m.APIURL), detail)
+	}
+	for _, ag := range agents {
+		if _, err := exec.LookPath(ag.Command); err != nil {
+			add("agent "+ag.Name, 2, "command %q not found", ag.Command)
 		} else {
-			add("backend "+m.Name, 0, "%s reachable", m.APIURL)
+			add("agent "+ag.Name, 0, "MCP server %s", ag.Command)
 		}
 	}
 	ids, err := ro.k.ProviderActiveBidIDs(ctx, commonAddr(cfg.Wallet.Address))
@@ -271,5 +290,64 @@ func doctorProvider(ctx context.Context, cfg *config.Config, ro *readOnly, add f
 			st = 1
 		}
 		add("bids", st, "%d active", len(ids))
+		if bids, err := ro.k.GetBids(ctx, ids); err == nil {
+			served := map[string]bool{}
+			for _, m := range cfg.Provider.Models {
+				served[strings.ToLower(m.ModelID)] = true
+			}
+			for _, ag := range cfg.Provider.Agents {
+				served[strings.ToLower(ag.AgentID)] = true
+			}
+			if ps.Enabled {
+				for _, l := range ps.Listings {
+					served[strings.ToLower(l)] = true
+				}
+			}
+			for _, b := range bids {
+				if id := strings.ToLower(common.Hash(b.ModelId).Hex()); !served[id] {
+					add("bid "+shortHash(b.ID.Hex()), 2, "model %s has no backend configured: consumers will be refused", shortHash(id))
+				}
+			}
+		}
+	}
+}
+
+// doctorStorage checks the Kubo node and the storage listings sold.
+func doctorStorage(ctx context.Context, ps config.ProviderStorageConfig, ro *readOnly, add func(string, int, string, ...any)) {
+	kc, err := kubo.New(ps.IPFSAPI, kubo.WithAuthorization(ps.IPFSAuth))
+	if err != nil {
+		add("storage ipfs", 2, "%v", err)
+		return
+	}
+	v, err := kc.Version(ctx)
+	if err != nil {
+		add("storage ipfs", 2, "Kubo at %s unreachable: %v (run `ipfs daemon`)", ps.IPFSAPI, err)
+		return
+	}
+	capacity, _ := config.ParseBytes(ps.MaxTotal)
+	if st, err := kc.RepoStat(ctx); err == nil {
+		if capacity == 0 {
+			capacity = st.StorageMax
+		}
+		add("storage ipfs", 0, "Kubo %s at %s · repo %s of %s", v, ps.IPFSAPI, config.FormatBytes(st.RepoSize), config.FormatBytes(st.StorageMax))
+	} else {
+		add("storage ipfs", 0, "Kubo %s at %s", v, ps.IPFSAPI)
+	}
+	if len(ps.Listings) == 0 {
+		add("storage listings", 2, "none (morcore provider storage-listing 100GiB)")
+	}
+	for _, l := range ps.Listings {
+		m, err := ro.k.GetModel(ctx, common.HexToHash(l))
+		switch {
+		case err != nil:
+			add("listing "+shortHash(l), 2, "%v", err)
+		case marketplace.StorageQuota(m.Tags) == 0:
+			add("listing "+shortHash(l), 2, "%s is not a storage listing (tags %s)", m.Name, strings.Join(m.Tags, ","))
+		case capacity > 0 && marketplace.StorageQuota(m.Tags) > capacity:
+			add("listing "+shortHash(l), 1, "%s sells %s per lease, more than the %s capacity: raise provider.storage.max_total or Kubo's Datastore.StorageMax",
+				m.Name, config.FormatBytes(marketplace.StorageQuota(m.Tags)), config.FormatBytes(capacity))
+		default:
+			add("listing "+shortHash(l), 0, "%s · %s per lease", m.Name, config.FormatBytes(marketplace.StorageQuota(m.Tags)))
+		}
 	}
 }

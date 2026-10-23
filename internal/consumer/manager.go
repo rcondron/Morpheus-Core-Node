@@ -36,6 +36,9 @@ type Options struct {
 	CloseOnShutdown bool
 	AutoWithdraw    bool
 	StorePath       string
+	// Leased reports models whose sessions another component manages (storage
+	// leases); Reconcile leaves them alone.
+	Leased func(modelID common.Hash) bool
 }
 
 var (
@@ -279,7 +282,7 @@ func (m *Manager) startOpenLocked(p *pool, exclude map[common.Address]bool) {
 		defer m.wg.Done()
 		ctx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
 		defer cancel()
-		s, err := m.open(ctx, &model, excl, common.Hash{})
+		s, err := m.open(ctx, &model, excl, common.Hash{}, m.routingTerms())
 		m.mu.Lock()
 		p.opening--
 		if err != nil {
@@ -340,7 +343,7 @@ func (m *Manager) Open(ctx context.Context, model *marketplace.Model, bidID comm
 	p.opening++
 	m.mu.Unlock()
 
-	s, err := m.open(ctx, model, nil, bidID)
+	s, err := m.open(ctx, model, nil, bidID, m.routingTerms())
 	m.mu.Lock()
 	p.opening--
 	if err == nil {
@@ -352,6 +355,19 @@ func (m *Manager) Open(ctx context.Context, model *marketplace.Model, bidID comm
 		m.persist()
 	}
 	return s, err
+}
+
+// OpenLease buys a session on a specific bid for the caller to manage itself
+// (storage leases): paid directly from the stake, for duration, outside the
+// routing pools, their stake cap and idle closing.
+func (m *Manager) OpenLease(ctx context.Context, model *marketplace.Model, bidID common.Hash, duration time.Duration) (*Session, error) {
+	return m.open(ctx, model, nil, bidID, openTerms{duration: duration, direct: true, lease: true})
+}
+
+// CloseLease closes a session opened with OpenLease, with the provider's
+// receipt when it answers.
+func (m *Manager) CloseLease(ctx context.Context, s *Session, reason string) error {
+	return m.closeSession(ctx, s, reason)
 }
 
 // Sessions returns snapshots of all tracked sessions.

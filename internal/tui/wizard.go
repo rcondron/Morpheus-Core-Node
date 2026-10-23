@@ -19,7 +19,6 @@ import (
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain"
 	"github.com/rcondron/Morpheus-Core-Node/internal/config"
 	"github.com/rcondron/Morpheus-Core-Node/internal/logx"
-	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/units"
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
 )
@@ -481,23 +480,13 @@ func askConsumer(cfg *config.Config) error {
 }
 
 func askProvider(ctx context.Context, cfg *config.Config, nw config.Network) error {
-	pm := config.ProviderModel{MaxSessions: 4}
-	if len(cfg.Provider.Models) > 0 {
-		pm = cfg.Provider.Models[0]
-	}
 	endpoint := cfg.Provider.PublicEndpoint
 	listen := cfg.Provider.Listen
-	maxSessions := strconv.Itoa(max(pm.MaxSessions, 1))
 	if err := run(
 		huh.NewNote().Title("Provider").Description(
-			"Consumers connect to your node over TCP (default port 3333) and your node forwards their "+
-				"prompts to your model server. Any OpenAI-compatible server works: vLLM, llama.cpp, Ollama, "+
-				"SGLang, LiteLLM, or a hosted API you resell."),
-		huh.NewInput().Title("Model server chat-completions URL").Placeholder("http://localhost:8000/v1/chat/completions").
-			Value(&pm.APIURL).Validate(validURL),
-		huh.NewInput().Title("Model server API key (optional)").EchoMode(huh.EchoModePassword).Value(&pm.APIKey),
-		huh.NewInput().Title("Model name your server expects").Placeholder("e.g. meta-llama/Llama-3.3-70B-Instruct").
-			Value(&pm.BackendModel).Validate(nonEmpty),
+			"Consumers connect to your node over TCP (port 3333 by default) and your node forwards their "+
+				"requests to the model backend: a hosted API you resell (Venice, OpenAI, Anthropic, OpenRouter, "+
+				"Groq, Prodia…) or your own server (vLLM, llama.cpp, Ollama, LM Studio…)."),
 		huh.NewInput().Title("Public address consumers reach you at (host:port)").
 			Description("Registered on-chain. Open this TCP port in your firewall.").Placeholder("provider.example.com:3333").
 			Value(&endpoint).Validate(func(v string) error {
@@ -508,78 +497,38 @@ func askProvider(ctx context.Context, cfg *config.Config, nw config.Network) err
 			_, _, err := net.SplitHostPort(v)
 			return err
 		}),
-		huh.NewSelect[string]().Title("Concurrent sessions your server can handle").
-			Options(huh.NewOption("1", "1"), huh.NewOption("4", "4"), huh.NewOption("8", "8"), huh.NewOption("16", "16"), huh.NewOption("Unlimited", "0")).
-			Value(&maxSessions),
 	); err != nil {
 		return err
 	}
-
-	// Which marketplace model are we serving? Joining an existing listing is
-	// better than minting duplicates.
-	var models []marketplace.Model
-	_ = Spin("Loading marketplace models", func() error {
-		c, err := chain.NewClient(cfg.Chain.RPCURLs, logx.Discard())
-		if err != nil {
-			return err
-		}
-		defer c.Close()
-		k := chain.NewContracts(c, common.HexToAddress(nw.DiamondAddress), common.HexToAddress(nw.MORTokenAddress), big.NewInt(nw.ChainID))
-		cctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
-		models, err = marketplace.New(k, nil, nil, logx.Discard()).Models(cctx)
-		return err
-	})
-	choice := pm.ModelID
-	opts := []huh.Option[string]{}
-	for _, m := range models {
-		label := fmt.Sprintf("%s  %s", m.Alias, Subtle.Render(fmt.Sprintf("(%d bids)", m.Bids)))
-		opts = append(opts, huh.NewOption(label, m.ID.Hex()))
-	}
-	opts = append(opts, huh.NewOption("Enter a model id manually / register a new model later", "manual"))
-	if choice == "" && len(models) > 0 {
-		choice = "manual"
-	}
-	if err := run(huh.NewSelect[string]().Title("Marketplace model you serve").Filtering(true).Height(12).
-		Description("Pick the existing listing for your model (type / to search).").Options(opts...).Value(&choice)); err != nil {
-		return err
-	}
-	if choice == "manual" {
-		choice = pm.ModelID
-		if err := run(huh.NewInput().Title("Model id (0x…, 32 bytes)").
-			Description("Use `morcore provider model-register` later to create a new listing.").
-			Value(&choice).Validate(func(v string) error {
-			v = strings.TrimSpace(v)
-			if v == "" {
-				return nil
-			}
-			if !strings.HasPrefix(v, "0x") || len(v) != 66 {
-				return errors.New("expected 0x followed by 64 hex characters")
-			}
-			return nil
-		})); err != nil {
-			return err
-		}
-	}
-	pm.ModelID = strings.TrimSpace(choice)
-	for _, m := range models {
-		if strings.EqualFold(m.ID.Hex(), pm.ModelID) {
-			pm.Name = m.Alias
-		}
-	}
-	if pm.Name == "" {
-		pm.Name = pm.BackendModel
-	}
-	pm.MaxSessions, _ = strconv.Atoi(maxSessions)
 	cfg.Provider.Enabled = true
 	cfg.Provider.PublicEndpoint = strings.TrimSpace(endpoint)
 	cfg.Provider.Listen = strings.TrimSpace(listen)
-	if pm.ModelID != "" {
-		cfg.Provider.Models = []config.ProviderModel{pm}
-	} else {
-		cfg.Provider.Models = nil
+
+	for {
+		add := true
+		title := "Add a model to sell now?"
+		if n := len(cfg.Provider.Models); n > 0 {
+			title = fmt.Sprintf("You sell %d model(s). Add another?", n)
+			add = false
+		}
+		if err := run(huh.NewConfirm().Title(title).
+			Description("You can also add models later with `morcore provider add`.").Value(&add)); err != nil {
+			return err
+		}
+		if !add {
+			return nil
+		}
+		pm, err := AskOffering(ctx, cfg, nw)
+		if errors.Is(err, ErrAborted) {
+			return err
+		}
+		if err != nil {
+			fmt.Println(Warning.Render("  " + err.Error()))
+			continue
+		}
+		cfg.Provider.Models, _, _ = config.MergeModels(cfg.Provider.Models, []config.ProviderModel{*pm})
+		fmt.Println(Good.Render("  ✓ ") + pm.Name + Subtle.Render(" via "+pm.BackendModel))
 	}
-	return nil
 }
 
 func nonEmpty(v string) error {

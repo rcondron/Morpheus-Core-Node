@@ -85,6 +85,44 @@ func TestZZGenerateGoldenVectors(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	v["reportResponse"] = rres
 
+	// Chunked uploads (audio transcription).
+	streamID := "0123abcd0123abcd0123abcd0123abcd"
+	ssreq, err := m.SessionPromptStreamStartRequest(sessionID, streamID, 3, "audio/mpeg", 2500000, userKey, "10")
+	if err != nil { t.Fatal(err) }
+	v["streamStartRequest"] = ssreq
+	ssres, err := m.SessionPromptStreamStartResponse(streamID, "started", provKey, "10")
+	if err != nil { t.Fatal(err) }
+	v["streamStartResponse"] = ssres
+	scReq, err := m.SessionPromptStreamChunkRequest(sessionID, streamID, 1, []byte("chunk bytes ✓"), userKey, "11")
+	if err != nil { t.Fatal(err) }
+	v["streamChunkRequest"] = scReq
+	scRes, err := m.SessionPromptStreamChunkResponse(streamID, 1, "received", provKey, "11")
+	if err != nil { t.Fatal(err) }
+	v["streamChunkResponse"] = scRes
+	seReq, err := m.SessionPromptStreamEndRequest(sessionID, streamID, `{"Model":"whisper","Language":"en","type":"audio_transcription"}`, userKey, "12")
+	if err != nil { t.Fatal(err) }
+	v["streamEndRequest"] = seReq
+
+	// MCP agents.
+	atReq, err := m.CallGetAgentToolsRequest(sessionID, userKey, "13")
+	if err != nil { t.Fatal(err) }
+	v["agentToolsRequest"] = atReq
+	acReq, err := m.CallAgentToolRequest(sessionID, "add", map[string]interface{}{"a": 2, "b": 40}, userKey, "14")
+	if err != nil { t.Fatal(err) }
+	v["agentCallRequest"] = acReq
+	agentPlain := `{"content":[{"type":"text","text":"42"}],"isError":false}`
+	encAgent, _ := lib.EncryptString(agentPlain, lib.RemoveHexPrefix(userPub.Hex()))
+	acRes, err := m.CallAgentToolResponse(encAgent, provKey, "14")
+	if err != nil { t.Fatal(err) }
+	v["agentCallResponse"] = acRes
+	v["agentCallResponsePlain"] = agentPlain
+
+	// A text-to-speech chunk: the audio bytes as a JSON (base64) string.
+	speech, _ := json.Marshal([]byte("AUDIO ✓ bytes"))
+	encSpeech, _ := lib.EncryptString(string(speech), lib.RemoveHexPrefix(userPub.Hex()))
+	spRes, _ := m.SessionPromptResponse(encSpeech, provKey, "15")
+	v["speechResponse"] = spRes
+
 	b, _ := json.MarshalIndent(v, "", "  ")
 	if err := os.WriteFile(out, b, 0o644); err != nil { t.Fatal(err) }
 }

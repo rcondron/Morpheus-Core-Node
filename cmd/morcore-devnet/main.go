@@ -1,7 +1,8 @@
 // Command morcore-devnet runs a local, simulated Morpheus marketplace for
 // development and demos: an in-memory BASE-like chain with the Diamond, MOR and
-// Multicall3, one or more providers, and an echo model (or your own
-// OpenAI-compatible backend). No real funds are involved.
+// Multicall3, one or more providers, an echo model (or your own
+// OpenAI-compatible backend) and a storage listing backed by an in-memory IPFS
+// node (or your Kubo). No real funds are involved.
 //
 //	go run ./cmd/morcore-devnet
 //	morcore init --yes --network local --key-env DEVNET_KEY --password-env MORCORE_PASSWORD --api-key demo
@@ -30,9 +31,14 @@ import (
 
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain"
 	"github.com/rcondron/Morpheus-Core-Node/internal/chain/chaintest"
+	"github.com/rcondron/Morpheus-Core-Node/internal/config"
 	"github.com/rcondron/Morpheus-Core-Node/internal/events"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/ipfstest"
+	"github.com/rcondron/Morpheus-Core-Node/internal/ipfs/kubo"
+	"github.com/rcondron/Morpheus-Core-Node/internal/marketplace"
 	"github.com/rcondron/Morpheus-Core-Node/internal/morrpc"
 	"github.com/rcondron/Morpheus-Core-Node/internal/provider"
+	"github.com/rcondron/Morpheus-Core-Node/internal/storage"
 	"github.com/rcondron/Morpheus-Core-Node/internal/wallet"
 )
 
@@ -46,6 +52,8 @@ func main() {
 	backend := flag.String("backend", "", "OpenAI-compatible chat completions URL (default: built-in echo model)")
 	backendModel := flag.String("backend-model", "echo", "model name sent to the backend")
 	models := flag.String("models", "llama-3.3-70b,qwen3-235b", "comma-separated marketplace model names to list")
+	storageQuota := flag.String("storage", "10GiB", "quota per lease of the storage listing (\"\" for none)")
+	ipfsAPI := flag.String("ipfs-api", "", "Kubo RPC API for the storage providers (default: in-memory IPFS)")
 	verbose := flag.Bool("v", false, "verbose provider logs")
 	flag.Parse()
 
@@ -90,6 +98,16 @@ func main() {
 		ids[i] = fc.AddModel(name, "LLM")
 		fmt.Printf("  Model        %-20s %s\n", name, ids[i].Hex())
 	}
+	var listing common.Hash
+	quota, err := config.ParseBytes(*storageQuota)
+	if err != nil {
+		fail(err)
+	}
+	if quota > 0 {
+		name := "ipfs-storage-" + strings.ToLower(strings.ReplaceAll(config.FormatBytes(quota), " ", ""))
+		listing = fc.AddModel(name, marketplace.StorageTags(quota)...)
+		fmt.Printf("  Storage      %-20s %s\n", name, listing.Hex())
+	}
 	for pi := 0; pi < 2; pi++ {
 		pw, _ := wallet.Generate()
 		pln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -103,6 +121,25 @@ func main() {
 			fc.AddBid(pw.Address(), ids[i], big.NewInt(prices[(i+pi)%len(prices)]))
 		}
 		p := provider.New(provider.Options{Models: pmodels, Version: "devnet"}, pw, k, chain.NewTxSender(k, pw, false, log), events.New(), log)
+		if quota > 0 {
+			api := *ipfsAPI
+			if api == "" {
+				node := ipfstest.New()
+				defer node.Close()
+				api = node.URL
+			}
+			kc, err := kubo.New(api)
+			if err != nil {
+				fail(err)
+			}
+			st := storage.NewServer(storage.ServerOptions{Listings: []common.Hash{listing}, MaxFileBytes: 1 << 30, MaxTotal: 1 << 40, Grace: time.Hour, Version: "devnet"},
+				pw, k, kc, p.ServesFor, events.New(), log)
+			p.SetStorage(st)
+			go st.Run(ctx)
+			// 0.2 and 0.3 MOR per GiB-month.
+			perSecond := new(big.Int).Div(new(big.Int).Mul(chaintest.MORs(int64(2+pi)), new(big.Int).SetUint64(quota)), big.NewInt(10*(1<<30)*30*24*3600))
+			fc.AddBid(pw.Address(), listing, perSecond)
+		}
 		go func() { _ = (&morrpc.Server{Handler: p.Handle, Log: log}).Serve(ctx, pln) }()
 		fmt.Printf("  Provider %d   %s at %s\n", pi+1, pw.Address().Hex(), pln.Addr())
 	}

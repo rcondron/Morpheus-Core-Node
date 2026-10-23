@@ -26,11 +26,12 @@ import (
 const (
 	ScopeInference = "inference" // chat, embeddings, model listing
 	ScopeSessions  = "sessions"  // view/open/close marketplace sessions
+	ScopeStorage   = "storage"   // upload, read and delete files on marketplace storage
 	ScopeAdmin     = "admin"     // everything, including key management
 )
 
 // AllScopes lists valid scopes.
-var AllScopes = []string{ScopeInference, ScopeSessions, ScopeAdmin}
+var AllScopes = []string{ScopeInference, ScopeSessions, ScopeStorage, ScopeAdmin}
 
 // SecretPrefix starts every key, so secrets are easy to recognize and scan for.
 const SecretPrefix = "sk-mor-"
